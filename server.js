@@ -8,7 +8,7 @@ const { createDb, dbUrl } = require('./db');
 const storage = require('./storage');
 
 let D, SECRET;
-const SCHEMA_VERSION = '2';
+const SCHEMA_VERSION = '3';
 const logErr = (e, ctx = '') => { console.error(`[${ctx}]`, (e && e.stack) || e); if (D) D.run('INSERT INTO error_logs(context,message) VALUES(@c,@m)', { c: String(ctx).slice(0, 200), m: String((e && e.stack) || e).slice(0, 2000) }).catch(() => {}); };
 process.on('unhandledRejection', e => logErr(e, 'unhandled'));
 
@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS events(id SERIAL PRIMARY KEY, type TEXT NOT NULL, pay
 CREATE TABLE IF NOT EXISTS error_logs(id SERIAL PRIMARY KEY, context TEXT, message TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;
 CREATE TABLE IF NOT EXISTS images(id TEXT PRIMARY KEY, content_type TEXT NOT NULL, data BYTEA NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_discount_pct DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_discount_amt DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_discount_name TEXT;
+CREATE TABLE IF NOT EXISTS discount_rules(id SERIAL PRIMARY KEY, name TEXT NOT NULL, min_amount DOUBLE PRECISION NOT NULL CHECK(min_amount>=0), percent DOUBLE PRECISION NOT NULL CHECK(percent>0 AND percent<=100),
+  active INTEGER NOT NULL DEFAULT 1, created_by INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS ix_orders_created ON orders(created_at); CREATE INDEX IF NOT EXISTS ix_orders_user ON orders(user_id); CREATE INDEX IF NOT EXISTS ix_orders_cust ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_items_order ON order_items(order_id); CREATE INDEX IF NOT EXISTS ix_pay_cust ON payments(customer_id); CREATE INDEX IF NOT EXISTS ix_logs_created ON activity_logs(created_at);`;
 const DEFAULT_SET = { business_name: 'My Business', business_address: '', business_phone: '', business_email: '', bank_details: '', receipt_footer: 'Thank you!', route_name: '', tz_offset: '330', low_stock: '10', logo: '', invoice_seq: '0' };
@@ -93,7 +98,7 @@ const A = async (req, action, entity, id, detail) => { try { await D.run('INSERT
 const toBuf = doc => new Promise((ok, no) => { const c = []; doc.on('data', x => c.push(x)); doc.on('end', () => ok(Buffer.concat(c))); doc.on('error', no); });
 
 // ───────── roles & permissions ─────────
-const ALL = ['pos.sell', 'pos.discount', 'orders.view_all', 'orders.view_own', 'orders.cancel', 'products.view', 'products.manage', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'];
+const ALL = ['pos.sell', 'pos.discount', 'discounts.manage', 'orders.view_all', 'orders.view_own', 'orders.cancel', 'products.view', 'products.manage', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'];
 const DEF = {
   owner: ALL,
   manager: ['pos.sell', 'pos.discount', 'orders.view_all', 'orders.view_own', 'products.view', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'],
@@ -313,22 +318,29 @@ app.post('/api/orders', auth, need('pos.sell'), wrap(async (req, res) => {
         if (!up.count) bad(`Not enough stock for ${p.name} (available ${(await t.get('SELECT stock FROM products WHERE id=@id', { id: p.id })).stock})`, 409);
         sub += sg * gross; disc += sg * da; tax += sg * ta; total += sg * lt; lines.push({ p, qty, ret, dp, da, ta, lt: sg * lt });
       }
-      sub = r2(sub); disc = r2(disc); tax = r2(tax); total = r2(total); if (total < 0) bad('Returns exceed the sale total');
+      // Automatic bill discount: judged on the bill after product discounts and before tax; the single best matching rule applies (rules never stack).
+      sub = r2(sub); disc = r2(disc); tax = r2(tax); const net = r2(sub - disc); if (net < 0) bad('Returns exceed the sale total');
+      const matched = (await t.all('SELECT * FROM discount_rules WHERE active=1 ORDER BY percent DESC, min_amount DESC')).find(r => net >= r.min_amount - 1e-9) || null;
+      const waived = !!(b.skip_bill_discount && canDisc && matched), rule = waived ? null : matched;
+      const billPct = rule ? rule.percent : 0, billAmt = rule ? r2(net * billPct / 100) : 0;
+      if (rule) tax = r2(tax * (1 - billPct / 100));
+      total = r2(net - billAmt + tax); const discAll = r2(disc + billAmt);
       const paid = method === 'credit' ? r2(num(b.paid ?? 0, 0, total, 'Paid amount')) : total;
       const prev = cust ? Math.max(0, await custBalance(cust.id, t)) : 0;
       const seq = parseInt((await t.get("UPDATE settings SET value=((value::int)+1)::text WHERE key='invoice_seq' RETURNING value")).value), inv = 'INV-' + String(seq).padStart(6, '0');
-      const id = (await t.get('INSERT INTO orders(invoice_no,client_ref,customer_id,customer_name,user_id,subtotal,discount_total,tax_total,total,paid,prev_outstanding,payment_method,note) VALUES(@inv,@ref,@cid,@cn,@u,@s,@d,@t,@tt,@p,@pv,@m,@n) RETURNING id',
-        { inv, ref, cid: cust?.id ?? null, cn: cust?.name ?? (str(b.customer_name, 100) || 'Walk-in Customer'), u: req.user.id, s: sub, d: disc, t: tax, tt: total, p: paid, pv: prev, m: method, n: str(b.note, 200) })).id;
+      const id = (await t.get('INSERT INTO orders(invoice_no,client_ref,customer_id,customer_name,user_id,subtotal,discount_total,tax_total,total,paid,prev_outstanding,payment_method,note,bill_discount_pct,bill_discount_amt,bill_discount_name) VALUES(@inv,@ref,@cid,@cn,@u,@s,@d,@t,@tt,@p,@pv,@m,@n,@bp,@ba,@bn) RETURNING id',
+        { inv, ref, cid: cust?.id ?? null, cn: cust?.name ?? (str(b.customer_name, 100) || 'Walk-in Customer'), u: req.user.id, s: sub, d: discAll, t: tax, tt: total, p: paid, pv: prev, m: method, n: str(b.note, 200), bp: billPct, ba: billAmt, bn: rule ? rule.name : null })).id;
       const vals = [], ph = lines.map(l => { vals.push(id, l.p.id, l.p.sku, l.p.name, l.qty, l.p.price, l.p.cost, l.dp, l.da, l.p.tax_pct, l.ta, l.lt, l.ret); return '(' + Array(13).fill('?').join(',') + ')'; });
       await t.run(`INSERT INTO order_items(order_id,product_id,sku,name,qty,unit_price,cost,discount_pct,discount_amt,tax_pct,tax_amt,line_total,is_return) VALUES ${ph.join(',')}`, vals);
-      return { id, invoice_no: inv, total, disc };
+      return { id, invoice_no: inv, total, disc: discAll, bill: billAmt, billPct, billName: rule ? rule.name : null, waived: waived ? matched.name : null };
     });
   } catch (e) { if (e.code === '23505' && /client_ref/.test(`${e.constraint} ${e.detail} ${e.message}`)) { const ex = await D.get('SELECT id,invoice_no,total FROM orders WHERE client_ref=@r', { r: ref }); if (ex) return res.json({ ...ex, duplicate: true }); } throw e; }
   if (out.duplicate) return res.json(out);
   await A(req, 'order.create', 'order', out.id, `${out.invoice_no} Rs.${out.total} ${method}`); if (out.disc > 0) await A(req, 'discount.applied', 'order', out.id, `${out.invoice_no}: Rs.${out.disc}`);
+  if (out.bill > 0) await A(req, 'discount.bill', 'order', out.id, `${out.invoice_no}: ${out.billName} ${out.billPct}% = Rs.${out.bill}`); if (out.waived) await A(req, 'discount.waived', 'order', out.id, `${out.invoice_no}: bill discount "${out.waived}" removed by ${req.user.username}`);
   try { await savePdf(out.id, false); } catch (e) { logErr(e, 'pdf'); } // order is already saved; PDF is regenerated on demand if this failed
   await emit('order', { id: out.id, invoice_no: out.invoice_no, total: out.total, employee: req.user.name, event: 'created' }, req.user.id); await emit('product', {});
-  res.json({ id: out.id, invoice_no: out.invoice_no, total: out.total });
+  res.json({ id: out.id, invoice_no: out.invoice_no, total: out.total, bill_discount: out.bill, bill_discount_pct: out.billPct });
 }));
 app.get('/api/orders', auth, need('orders.view_all', 'orders.view_own'), wrap(async (req, res) => {
   const w = ['1=1'], p = { off: await offMin() }, all = req.perms.includes('orders.view_all');
@@ -355,12 +367,32 @@ app.post('/api/orders/:id/cancel', auth, need('orders.cancel'), wrap(async (req,
   await A(req, 'order.cancel', 'order', o.id, `${o.invoice_no}: ${reason}`); await emit('order', { id: o.id, invoice_no: o.invoice_no, event: 'cancelled' }, o.user_id); await emit('product', {}); res.json({ ok: true });
 }));
 
+// ───────── automatic bill discount rules ─────────
+const ruleBody = (b, cur) => {
+  const min = r2(num(b.min_amount ?? cur?.min_amount, 0, 1e9, 'Minimum bill amount')), pct = num(b.percent ?? cur?.percent, 0.01, 100, 'Discount percent');
+  return { min, pct, name: str(b.name ?? cur?.name, 60) || `${pct}% off bills of Rs. ${min}+`, active: b.active === undefined ? (cur ? cur.active : 1) : (b.active ? 1 : 0) };
+};
+app.get('/api/discount-rules', auth, need('pos.sell', 'discounts.manage'), wrap(async (req, res) => res.json(await D.all(`SELECT id,name,min_amount,percent,active FROM discount_rules ${req.perms.includes('discounts.manage') ? '' : 'WHERE active=1'} ORDER BY min_amount, percent`))));
+app.post('/api/discount-rules', auth, need('discounts.manage'), wrap(async (req, res) => {
+  const r = ruleBody(req.body || {}), id = (await D.get('INSERT INTO discount_rules(name,min_amount,percent,active,created_by) VALUES(@n,@m,@p,@a,@u) RETURNING id', { n: r.name, m: r.min, p: r.pct, a: r.active, u: req.user.id })).id;
+  await A(req, 'discount_rule.create', 'discount_rule', id, `${r.name}: Rs.${r.min}+ → ${r.pct}%`); await emit('rules', {}); res.json({ id });
+}));
+app.patch('/api/discount-rules/:id', auth, need('discounts.manage'), wrap(async (req, res) => {
+  const cur = await D.get('SELECT * FROM discount_rules WHERE id=@id', { id: +req.params.id }); if (!cur) bad('Rule not found', 404); const r = ruleBody(req.body || {}, cur);
+  await D.run('UPDATE discount_rules SET name=@n,min_amount=@m,percent=@p,active=@a WHERE id=@id', { n: r.name, m: r.min, p: r.pct, a: r.active, id: cur.id });
+  await A(req, 'discount_rule.update', 'discount_rule', cur.id, `${r.name}: Rs.${r.min}+ → ${r.pct}%${r.active ? '' : ' (disabled)'}`); await emit('rules', {}); res.json({ ok: true });
+}));
+app.delete('/api/discount-rules/:id', auth, need('discounts.manage'), wrap(async (req, res) => {
+  const cur = await D.get('SELECT * FROM discount_rules WHERE id=@id', { id: +req.params.id }); if (!cur) bad('Rule not found', 404);
+  await D.run('DELETE FROM discount_rules WHERE id=@id', { id: cur.id }); await A(req, 'discount_rule.delete', 'discount_rule', cur.id, cur.name); await emit('rules', {}); res.json({ ok: true });
+}));
+
 // ───────── analytics ─────────
 async function summary(from, to) {
   const off = await offMin(), t = await today(), P = (a, b) => D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b });
   const cards = { today: await P(t, t), yesterday: await P(addDays(t, -1), addDays(t, -1)), week: await P(addDays(t, -6), t), month: await P(t.slice(0, 8) + '01', t), year: await P(t.slice(0, 5) + '01-01', t) };
   const base = { off, a: from, b: to };
-  const range_stats = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts,COALESCE(SUM(tax_total),0) tax,COALESCE(SUM(CASE WHEN paid>=total-0.005 THEN 1 ELSE 0 END),0)::int paid_orders,COALESCE(SUM(CASE WHEN paid<total-0.005 THEN 1 ELSE 0 END),0)::int unpaid_orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, base);
+  const range_stats = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts,COALESCE(SUM(bill_discount_amt),0) bill_discounts,COALESCE(SUM(tax_total),0) tax,COALESCE(SUM(CASE WHEN paid>=total-0.005 THEN 1 ELSE 0 END),0)::int paid_orders,COALESCE(SUM(CASE WHEN paid<total-0.005 THEN 1 ELSE 0 END),0)::int unpaid_orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, base);
   range_stats.avg_order = range_stats.orders ? r2(range_stats.revenue / range_stats.orders) : 0; range_stats.cancelled = (await D.get(`SELECT COUNT(*)::int n FROM orders o WHERE status='cancelled' AND ${L} BETWEEN @a AND @b`, base)).n;
   const grp = e => D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) revenue,COUNT(*)::int orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1 ORDER BY 1`, base);
   const day = await grp(`to_char(${L},'YYYY-MM-DD')`), map = new Map(day.map(r => [r.label, r])), filled = []; for (let d = from, n = 0; d <= to && n < 400; d = addDays(d, 1), n++) filled.push(map.get(d) || { label: d, revenue: 0, orders: 0 });
@@ -378,7 +410,7 @@ app.get('/api/reports/export', auth, need('reports.export'), wrap(async (req, re
   if (req.query.type === 'pdf') { const buf = await toBuf(reportPDF(d, S)); res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="report-${from}_${to}.pdf"` }); return res.end(buf); }
   const wb = new ExcelJS.Workbook(); wb.creator = S.business_name; const hd = ws => { ws.getRow(1).font = { bold: true }; ws.views = [{ state: 'frozen', ySplit: 1 }]; };
   let ws = wb.addWorksheet('Summary'); ws.columns = [{ header: 'Metric', width: 34 }, { header: 'Value', width: 20 }]; hd(ws); const r = d.range_stats;
-  [['From', from], ['To', to], ['Total revenue', r.revenue], ['Orders', r.orders], ['Average order value', r.avg_order], ['Total discounts', r.discounts], ['Tax collected', r.tax], ['Paid orders', r.paid_orders], ['Unpaid/partial orders', r.unpaid_orders], ['Cancelled orders', r.cancelled], ['Outstanding creditor balance', d.outstanding]].forEach(x => ws.addRow(x));
+  [['From', from], ['To', to], ['Total revenue', r.revenue], ['Orders', r.orders], ['Average order value', r.avg_order], ['Total discounts', r.discounts], ['  of which automatic bill discounts', r.bill_discounts], ['Tax collected', r.tax], ['Paid orders', r.paid_orders], ['Unpaid/partial orders', r.unpaid_orders], ['Cancelled orders', r.cancelled], ['Outstanding creditor balance', d.outstanding]].forEach(x => ws.addRow(x));
   ws = wb.addWorksheet('Daily'); ws.columns = [{ header: 'Date', width: 14 }, { header: 'Orders', width: 10 }, { header: 'Revenue', width: 16 }]; hd(ws); d.series.day.forEach(s => ws.addRow([s.label, s.orders, s.revenue]));
   ws = wb.addWorksheet('Products'); ws.columns = [{ header: 'Product', width: 34 }, { header: 'Qty sold', width: 12 }, { header: 'Revenue', width: 16 }, { header: 'Discount', width: 14 }]; hd(ws); d.products.forEach(p => ws.addRow([p.name, p.qty, p.revenue, p.discount]));
   ws = wb.addWorksheet('Employees'); ws.columns = [{ header: 'Name', width: 26 }, { header: 'Role', width: 12 }, { header: 'Orders', width: 10 }, { header: 'Revenue', width: 16 }, { header: 'Discounts', width: 14 }]; hd(ws); d.employees.forEach(e => ws.addRow([e.name, e.role, e.orders, e.revenue, e.discounts]));

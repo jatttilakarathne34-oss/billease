@@ -69,7 +69,8 @@ function a4(o, S) {
   if (y + 150 > 760) { footer(); doc.addPage(); y = 50; }
   const tr = (l, v, b, sz = 9.5, c = '#000000') => { font(b, sz, c); one(l, 330, y, 130); one(v, 455, y, R - 455, 'right'); y += sz + 5; };
   const net = o.subtotal - o.discount_total;
-  if (o.discount_total > 0.005) { tr('Subtotal', m(o.subtotal)); tr('Discount', '- ' + m(o.discount_total)); }
+  const bill = o.bill_discount_amt || 0, prodDisc = o.discount_total - bill;
+  if (o.discount_total > 0.005) { tr('Subtotal', m(o.subtotal)); if (prodDisc > 0.005) tr('Discount', '- ' + m(prodDisc)); if (bill > 0.005) tr(`Bill discount (${q(o.bill_discount_pct)}%)`, '- ' + m(bill), 0, 9.5, '#166534'); }
   tr('Net amount', m(net), 1); tr('Sales tax', m(o.tax_total), 1);
   doc.lineWidth(0.8).strokeColor('#000000').moveTo(330, y).lineTo(R, y).stroke().moveTo(330, y + 2).lineTo(R, y + 2).stroke(); y += 9;
   tr('Invoice total (Rs.)', m(o.total), 1, 11.5); y += 2;
@@ -108,7 +109,7 @@ function thermalDraw(doc, o, S) {
     if (i.discount_amt) pair(`   Disc ${q(i.discount_pct)}%`, '-' + m(i.discount_amt), false, 8.5);
   });
   line();
-  pair('Gross Amount :', m(o.subtotal)); pair('Discount :', m(o.discount_total));
+  const bill = o.bill_discount_amt || 0; pair('Gross Amount :', m(o.subtotal)); pair('Discount :', m(o.discount_total - bill)); if (bill > 0.005) pair(`Bill disc ${q(o.bill_discount_pct)}% :`, m(bill));
   if (o.tax_total) pair('Tax :', m(o.tax_total));
   line();
   pair('Net Amount :', m(o.total), true, 11); pair('Outstanding :', m(o.prev_outstanding));
@@ -135,7 +136,7 @@ function reportPDF(d, S) {
   const kv = (k, v) => { const y = doc.y; doc.fillColor('#111').font('Helvetica').fontSize(10.5).text(k, 40, y, { width: 250 }).font('Helvetica-Bold').text(v, 300, y, { width: 255, align: 'right' }); doc.moveDown(0.3); };
   const r = d.range_stats;
   kv('Total revenue', 'Rs. ' + m(r.revenue)); kv('Orders', String(r.orders)); kv('Average order value', 'Rs. ' + m(r.avg_order));
-  kv('Total discounts', 'Rs. ' + m(r.discounts)); kv('Tax collected', 'Rs. ' + m(r.tax));
+  kv('Total discounts', 'Rs. ' + m(r.discounts)); kv('  of which automatic bill discounts', 'Rs. ' + m(r.bill_discounts || 0)); kv('Tax collected', 'Rs. ' + m(r.tax));
   kv('Paid orders / Unpaid-partial orders', `${r.paid_orders} / ${r.unpaid_orders}`); kv('Outstanding creditor balance', 'Rs. ' + m(d.outstanding));
   const table = (title, cols, rows) => {
     doc.moveDown(1).font('Helvetica-Bold').fontSize(12).fillColor('#1d4ed8').text(title).moveDown(0.3);

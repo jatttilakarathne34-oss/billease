@@ -5,9 +5,9 @@ const money = n => Number(n || 0).toLocaleString('en-US', { minimumFractionDigit
 const rs = n => 'Rs. ' + money(n), qn = n => String(Math.round(n * 1000) / 1000);
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12));
 const ldate = s => new Date(s).toLocaleString();
-const S = { me: null, perms: [], cfg: {}, products: [], cart: [], ref: null, pay: { method: 'cash', paid: '', note: '', customer: '' }, charts: {}, view: '', cust: [] };
+const S = { me: null, perms: [], cfg: {}, products: [], cart: [], ref: null, pay: { method: 'cash', paid: '', note: '', customer: '' }, charts: {}, view: '', cust: [], rules: [] };
 const can = (...p) => p.some(x => S.perms.includes(x));
-const PL = { 'pos.sell': 'Use billing / POS', 'pos.discount': 'Change discounts at billing', 'orders.view_all': 'View all orders', 'orders.view_own': 'View own orders', 'orders.cancel': 'Cancel orders', 'products.view': 'View products page', 'products.manage': 'Add / edit / archive products', 'inventory.manage': 'Adjust stock', 'customers.manage': 'Manage customers', 'creditors.manage': 'Manage creditors & payments', 'reports.view': 'View reports & dashboard', 'reports.export': 'Export reports', 'users.manage': 'Manage users', 'logs.view': 'View activity log' };
+const PL = { 'pos.sell': 'Use billing / POS', 'pos.discount': 'Change discounts / waive the bill discount at billing', 'discounts.manage': 'Manage automatic bill-discount rules', 'orders.view_all': 'View all orders', 'orders.view_own': 'View own orders', 'orders.cancel': 'Cancel orders', 'products.view': 'View products page', 'products.manage': 'Add / edit / archive products', 'inventory.manage': 'Adjust stock', 'customers.manage': 'Manage customers', 'creditors.manage': 'Manage creditors & payments', 'reports.view': 'View reports & dashboard', 'reports.export': 'Export reports', 'users.manage': 'Manage users', 'logs.view': 'View activity log' };
 
 async function api(path, o = {}) {
   const r = await fetch('/api' + path, { method: o.method || 'GET', headers: { 'Content-Type': 'application/json', 'X-CSRF': '1' }, body: o.body ? JSON.stringify(o.body) : undefined, credentials: 'same-origin' });
@@ -51,7 +51,7 @@ function authScreen(st, setup) {
 
 // ───────── shell & router ─────────
 const NAV = [['dashboard', '📊', 'Dashboard', ['reports.view']], ['pos', '🧾', 'Billing', ['pos.sell']], ['orders', '📋', 'Orders', ['orders.view_all', 'orders.view_own']], ['products', '📦', 'Products', ['products.view']], ['stock', '🏷️', 'Stock', ['inventory.manage']],
-  ['customers', '👥', 'Customers', ['customers.manage']], ['creditors', '💳', 'Creditors', ['creditors.manage']], ['reports', '📈', 'Reports', ['reports.view']], ['users', '🔐', 'Users', ['users.manage']], ['logs', '🕘', 'Activity Log', ['logs.view']], ['settings', '⚙️', 'Settings', ['OWNER']]];
+  ['customers', '👥', 'Customers', ['customers.manage']], ['creditors', '💳', 'Creditors', ['creditors.manage']], ['reports', '📈', 'Reports', ['reports.view']], ['discounts', '🎁', 'Discounts', ['discounts.manage']], ['users', '🔐', 'Users', ['users.manage']], ['logs', '🕘', 'Activity Log', ['logs.view']], ['settings', '⚙️', 'Settings', ['OWNER']]];
 const allowed = n => n[3][0] === 'OWNER' ? S.me.role === 'owner' : can(...n[3]);
 function shell() {
   const nav = NAV.filter(allowed); const role = { owner: 'Owner', manager: 'Manager', employee: 'Employee' }[S.me.role];
@@ -71,7 +71,7 @@ function route() {
   if (!ok.includes(v)) { v = can('reports.view') && can('orders.view_all') ? 'dashboard' : (ok.includes('pos') ? 'pos' : ok[0]); location.hash = '#/' + v; return; }
   S.view = v; $$('.nav a').forEach(a => a.classList.toggle('on', a.dataset.v === v));
   Object.values(S.charts).forEach(c => c.destroy()); S.charts = {};
-  const F = { dashboard: vDashboard, pos: vPos, orders: vOrders, products: vProducts, stock: vStock, customers: vCustomers, creditors: vCreditors, reports: vReports, users: vUsers, logs: vLogs, settings: vSettings }[v];
+  const F = { dashboard: vDashboard, pos: vPos, orders: vOrders, products: vProducts, stock: vStock, customers: vCustomers, creditors: vCreditors, reports: vReports, discounts: vDiscounts, users: vUsers, logs: vLogs, settings: vSettings }[v];
   $('#main').innerHTML = '<p class="mut">Loading…</p>'; Promise.resolve(F()).catch(e => { $('#main').innerHTML = `<div class="err">${esc(e.message)}</div>`; });
 }
 const head = (t, s, extra = '') => `<div class="row" style="margin-bottom:16px"><div class="sp"><div class="title">${t}</div><div class="mut">${s || ''}</div></div>${extra}</div>`;
@@ -99,6 +99,7 @@ async function handleEvent(e) {
       if (link && localStorage.autoPdf === '1') setTimeout(() => window.open(dl(d.id), '_blank'), 1200);
     } else if (d.event === 'cancelled') toast(`Order ${d.invoice_no} was cancelled`);
     if (['dashboard', 'orders'].includes(S.view)) route();
+  } else if (e.type === 'rules') { if (S.view === 'pos') { S.rules = await api('/discount-rules').catch(() => []); renderCart(); } else if (S.view === 'discounts') route();
   } else if (e.type === 'product') { if (S.view === 'pos') { await loadProducts(); renderList(); } else if (['products', 'stock'].includes(S.view)) route(); }
   else if (e.type === 'payment' && ['creditors', 'customers'].includes(S.view)) route();
 }
@@ -126,7 +127,7 @@ const saveCart = () => localStorage.setItem('cart_' + S.me.id, JSON.stringify({ 
 function loadCart() { try { const x = JSON.parse(localStorage['cart_' + S.me.id] || 'null'); if (x) { S.cart = x.cart || []; S.ref = x.ref; S.pay = x.pay || S.pay; } } catch {} }
 async function loadProducts() { S.products = await api('/products'); }
 async function vPos() {
-  await Promise.all([loadProducts(), api('/customers').then(c => S.cust = c).catch(() => S.cust = [])]);
+  await Promise.all([loadProducts(), api('/customers').then(c => S.cust = c).catch(() => S.cust = []), api('/discount-rules').then(r => S.rules = r.filter(x => x.active)).catch(() => S.rules = [])]);
   $('#main').innerHTML = `<div class="pos"><section><div class="row" style="margin-bottom:12px"><input id="ps" placeholder="🔍 Search product name or SKU…" autocomplete="off" style="flex:1"><span class="mut" id="mys"></span></div><div class="plist" id="pl"></div></section><aside class="cartpane" id="cp"></aside></div><button class="cartbar" id="cb"></button>`;
   $('#ps').oninput = renderList; $('#cb').onclick = () => $('#cp').classList.toggle('open');
   api('/me/stats').then(s => { const e = $('#mys'); if (e) e.textContent = `My sales today: ${rs(s.revenue)} (${s.orders})`; }).catch(() => {});
@@ -144,10 +145,15 @@ function addToCart(id) {
   if (!S.ref) S.ref = uid(); saveCart(); renderCart();
 }
 function calc() {
-  let sub = 0, disc = 0, tax = 0, total = 0;
+  let sub = 0, disc = 0, tax = 0;
   const L = S.cart.map(c => { const p = S.products.find(x => x.id === c.product_id) || { price: 0, tax_pct: 0, name: '?', stock: 0 }, sg = c.is_return ? -1 : 1, g = p.price * c.qty, d = g * (+c.discount_pct || 0) / 100, t = (g - d) * p.tax_pct / 100;
-    sub += sg * g; disc += sg * d; tax += sg * t; total += sg * (g - d + t); return { c, p, line: sg * (g - d + t) }; });
-  return { L, sub, disc, tax, total };
+    sub += sg * g; disc += sg * d; tax += sg * t; return { c, p, line: sg * (g - d + t) }; });
+  // automatic bill discount: bill after product discounts, before tax; best single matching rule
+  const net = sub - disc, rules = [...S.rules].sort((x, y) => y.percent - x.percent || y.min_amount - x.min_amount), match = rules.find(r => net >= r.min_amount - 1e-9) || null;
+  const waived = !!(S.pay.skipBill && can('pos.discount') && match), rule = waived ? null : match, pct = rule ? rule.percent : 0, bill = rule ? net * pct / 100 : 0;
+  if (rule) tax = tax * (1 - pct / 100);
+  const next = S.cart.length ? [...S.rules].filter(r => r.min_amount > net).sort((x, y) => x.min_amount - y.min_amount)[0] || null : null; // next tier to unlock
+  return { L, sub, disc, tax, total: net - bill + tax, rule, bill, pct, waived, match, next, net };
 }
 function renderCart() {
   const el = $('#cp'); if (!el) return; const t = calc(), n = S.cart.length, canD = can('pos.discount'), P = S.pay;
@@ -157,7 +163,8 @@ function renderCart() {
     <div class="ctl"><button class="qb" data-a="m" data-i="${i}">−</button><input type="number" inputmode="decimal" step="any" min="0" value="${x.c.qty}" data-a="q" data-i="${i}"><button class="qb" data-a="p" data-i="${i}">+</button>
     ${canD ? `<input type="number" inputmode="decimal" min="0" max="100" value="${x.c.discount_pct}" data-a="d" data-i="${i}" title="Discount %" style="width:64px"><span class="mut">%</span>` : (x.c.discount_pct ? `<span class="badge ok">${qn(x.c.discount_pct)}% off</span>` : '')}
     <span class="sp"></span><button class="btn sm" data-a="r" data-i="${i}">↩</button><button class="btn sm bad" data-a="x" data-i="${i}">✕</button></div></div>`).join('') || '<p class="mut" style="text-align:center;padding:24px 0">Tap products to add them</p>'}</div>
-  <div class="tot"><div><span>Subtotal</span><span class="mono">${money(t.sub)}</span></div><div><span>Discount</span><span class="mono">− ${money(t.disc)}</span></div>${t.tax ? `<div><span>Tax</span><span class="mono">${money(t.tax)}</span></div>` : ''}<div class="g"><span>Total</span><span class="mono">${rs(t.total)}</span></div></div>
+  <div class="tot"><div><span>Subtotal</span><span class="mono">${money(t.sub)}</span></div><div><span>Discount</span><span class="mono">− ${money(t.disc)}</span></div>${t.rule ? `<div style="color:var(--ok);font-weight:700"><span>🎁 ${esc(t.rule.name)}${t.rule.name.includes('%') ? '' : ` (${qn(t.pct)}%)`}</span><span class="mono">− ${money(t.bill)}</span></div>` : ''}${t.tax ? `<div><span>Tax</span><span class="mono">${money(t.tax)}</span></div>` : ''}<div class="g"><span>Total</span><span class="mono">${rs(t.total)}</span></div></div>
+  ${t.next ? `<div class="mut" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:9px;padding:8px 10px;margin-top:8px;font-size:12.5px">💡 Add <b>${rs(t.next.min_amount - t.net)}</b> more to get <b>${qn(t.next.percent)}% off</b> the bill</div>` : ''}${t.match && can('pos.discount') ? `<label style="display:flex;gap:8px;align-items:center;margin-top:8px;color:var(--ink);font-weight:500"><input type="checkbox" id="sb" style="width:auto;min-height:0" ${P.skipBill ? '' : 'checked'}> Apply bill discount (${qn(t.match.percent)}%)</label>` : ''}
   <div class="grid g2" style="margin-top:12px"><div><label>Payment</label><select id="pm">${['cash', 'card', 'transfer', 'credit'].map(m => `<option ${P.method === m ? 'selected' : ''} value="${m}">${m[0].toUpperCase() + m.slice(1)}</option>`).join('')}</select></div>
   <div id="pdw" style="display:${P.method === 'credit' ? '' : 'none'}"><label>Paid now (Rs.)</label><input type="number" inputmode="decimal" id="pd" value="${esc(P.paid)}" placeholder="0.00"></div></div>
   <div class="f" style="margin-top:10px"><label>Customer ${P.method === 'credit' ? '(required)' : '(optional)'}</label><div class="row" style="flex-wrap:nowrap"><select id="cs"><option value="">Walk-in customer</option>${cust}</select><button class="btn" id="nc">＋</button></div></div>
@@ -168,16 +175,17 @@ function renderCart() {
     if (a === 'p') c.qty = Math.round((c.qty + 1) * 1000) / 1000; if (a === 'm') c.qty = Math.max(0.001, Math.round((c.qty - 1) * 1000) / 1000) || 1; if (a === 'r') c.is_return = !c.is_return; if (a === 'x') S.cart.splice(i, 1);
     if (!S.cart.length) S.ref = null; saveCart(); renderCart(); };
   $('#lines').onchange = e => { const b = e.target, c = S.cart[+b.dataset.i]; if (!c) return; if (b.dataset.a === 'q') c.qty = Math.max(0.001, +b.value || 1); if (b.dataset.a === 'd') c.discount_pct = Math.min(100, Math.max(0, +b.value || 0)); saveCart(); renderCart(); };
+  const sb = $('#sb'); if (sb) sb.onchange = e => { P.skipBill = !e.target.checked; saveCart(); renderCart(); };
   $('#pm').onchange = e => { P.method = e.target.value; saveCart(); renderCart(); }; $('#cs').onchange = e => { P.customer = e.target.value; saveCart(); }; $('#nt').oninput = e => { P.note = e.target.value; saveCart(); }; const pd = $('#pd'); if (pd) pd.oninput = e => { P.paid = e.target.value; saveCart(); };
   $('#nc').onclick = () => custModal(null, c => { S.cust.push(c); P.customer = c.id; saveCart(); renderCart(); });
   $('#go').onclick = e => guard(e.target, completeOrder);
 }
-function resetCart() { S.cart = []; S.ref = null; S.pay = { method: 'cash', paid: '', note: '', customer: '' }; saveCart(); }
+function resetCart() { S.cart = []; S.ref = null; S.pay = { method: 'cash', paid: '', note: '', customer: '', skipBill: false }; saveCart(); }
 async function completeOrder() {
   if (!S.cart.length) return; const P = S.pay;
-  const r = await api('/orders', { method: 'POST', body: { client_ref: S.ref, customer_id: P.customer || null, payment_method: P.method, paid: P.method === 'credit' ? (+P.paid || 0) : undefined, note: P.note, items: S.cart.map(c => ({ product_id: c.product_id, qty: c.qty, is_return: c.is_return, discount_pct: can('pos.discount') ? c.discount_pct : undefined })) } });
+  const r = await api('/orders', { method: 'POST', body: { client_ref: S.ref, customer_id: P.customer || null, payment_method: P.method, skip_bill_discount: !!(P.skipBill && can('pos.discount')), paid: P.method === 'credit' ? (+P.paid || 0) : undefined, note: P.note, items: S.cart.map(c => ({ product_id: c.product_id, qty: c.qty, is_return: c.is_return, discount_pct: can('pos.discount') ? c.discount_pct : undefined })) } });
   resetCart(); $('#cp')?.classList.remove('open'); await loadProducts(); renderList(); renderCart();
-  modal(`<div style="text-align:center"><div style="font-size:44px">✅</div><h3>Order ${esc(r.invoice_no)} saved</h3><div class="title mono">${rs(r.total)}</div><p class="mut" style="margin:6px 0 16px">${r.duplicate ? 'This order was already saved.' : 'Synced to the main computer.'}</p>
+  modal(`<div style="text-align:center"><div style="font-size:44px">✅</div><h3>Order ${esc(r.invoice_no)} saved</h3><div class="title mono">${rs(r.total)}</div>${r.bill_discount > 0 ? `<div class="badge ok" style="margin-top:6px">🎁 ${qn(r.bill_discount_pct)}% bill discount applied: − ${rs(r.bill_discount)}</div>` : ''}<p class="mut" style="margin:6px 0 16px">${r.duplicate ? 'This order was already saved.' : 'Synced to the main computer.'}</p>
   <div class="grid"><a class="btn pri" target="_blank" href="${dl(r.id)}">📄 Open invoice (A4 PDF)</a><a class="btn" target="_blank" href="${dl(r.id, 'thermal')}">🧾 57mm receipt (PDF)</a>${navigator.bluetooth ? `<button class="btn" id="bt">📡 Print via Bluetooth</button>` : ''}<button class="btn" onclick="closeModal()">New bill</button></div></div>`);
   const bt = $('#bt'); if (bt) bt.onclick = () => guard(bt, () => btPrint(r.id));
 }
@@ -187,7 +195,7 @@ async function btPrint(id) {
   B.push(0x1B, 0x40, 0x1B, 0x61, 1, 0x1B, 0x45, 1, 0x1D, 0x21, 0x11); add((S.cfg.business_name || '') + '\n'); B.push(0x1D, 0x21, 0, 0x1B, 0x45, 0); add((S.cfg.business_address || '') + '\n' + D + 'SALES INVOICE\n'); B.push(0x1B, 0x61, 0);
   add(`INV REF No : ${o.invoice_no}\n${ldate(o.created_at)}\nRep : ${o.employee}\nCustomer : ${o.customer_name}\n${D}`);
   o.items.forEach(i => { add(i.name.slice(0, W) + '\n'); add(pr(`  ${money(i.unit_price)} x ${qn(i.qty)}`, money(i.line_total)) + '\n'); });
-  add(D + pr('Gross Amount:', money(o.subtotal)) + '\n' + pr('Discount:', money(o.discount_total)) + '\n' + D); B.push(0x1B, 0x45, 1);
+  add(D + pr('Gross Amount:', money(o.subtotal)) + '\n' + pr('Discount:', money(o.discount_total - (o.bill_discount_amt || 0))) + '\n' + (o.bill_discount_amt > 0 ? pr(`Bill disc ${qn(o.bill_discount_pct)}%:`, money(o.bill_discount_amt)) + '\n' : '') + D); B.push(0x1B, 0x45, 1);
   add(pr('Net Amount:', money(o.total)) + '\n'); B.push(0x1B, 0x45, 0); add(pr('Outstanding:', money(o.prev_outstanding)) + '\n'); B.push(0x1B, 0x45, 1); add(pr('Net Payable:', money(o.total + o.prev_outstanding)) + '\n'); B.push(0x1B, 0x45, 0);
   add(pr('Paid Amount:', money(o.paid)) + '\n' + D); B.push(0x1B, 0x61, 1); add((S.cfg.receipt_footer || 'Thank you!') + '\n\n\n\n'); B.push(0x1D, 0x56, 0x41, 0);
   const sv = BT.map(x => x[0]), dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: sv }), srv = await dev.gatt.connect(); let ch = null;
@@ -204,7 +212,7 @@ async function vOrders() {
     <td class="row" style="flex-wrap:nowrap"><a class="btn sm" target="_blank" href="${dl(o.id)}">PDF</a><a class="btn sm" target="_blank" href="${dl(o.id, 'thermal')}">57mm</a><button class="btn sm" data-d="${o.id}">View</button>${can('orders.cancel') && o.status === 'completed' ? `<button class="btn sm bad" data-c="${o.id}" data-n="${o.invoice_no}">Cancel</button>` : ''}</td></tr>`).join('') || '<tr><td class="mut">No orders found</td></tr>'; };
   $('#of2').onclick = load; await load();
   $('#ot2').onclick = async e => { const d = e.target.dataset.d, c = e.target.dataset.c;
-    if (d) { const o = await api('/orders/' + d); modal(`<h3>${o.invoice_no} <span class="badge ${o.status === 'completed' ? 'ok' : 'bad'}">${o.status}</span></h3><p class="mut">${ldate(o.created_at)} · ${esc(o.employee)} · ${esc(o.customer_name)}</p><div class="tw"><table><tr><th>Item</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Disc</th><th class="r">Total</th></tr>${o.items.map(i => `<tr><td>${i.is_return ? '↩ ' : ''}${esc(i.name)}</td><td class="r">${qn(i.qty)}</td><td class="r">${money(i.unit_price)}</td><td class="r">${money(i.discount_amt)}</td><td class="r">${money(i.line_total)}</td></tr>`).join('')}</table></div><p class="r" style="margin-top:10px">Subtotal ${money(o.subtotal)} · Discount ${money(o.discount_total)}<br><b>Total ${rs(o.total)}</b> · Paid ${money(o.paid)}</p>${o.cancel_reason ? `<div class="err">Cancelled: ${esc(o.cancel_reason)}</div>` : ''}<div class="row"><span class="sp"></span><button class="btn" onclick="closeModal()">Close</button></div>`, true); }
+    if (d) { const o = await api('/orders/' + d); modal(`<h3>${o.invoice_no} <span class="badge ${o.status === 'completed' ? 'ok' : 'bad'}">${o.status}</span></h3><p class="mut">${ldate(o.created_at)} · ${esc(o.employee)} · ${esc(o.customer_name)}</p><div class="tw"><table><tr><th>Item</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Disc</th><th class="r">Total</th></tr>${o.items.map(i => `<tr><td>${i.is_return ? '↩ ' : ''}${esc(i.name)}</td><td class="r">${qn(i.qty)}</td><td class="r">${money(i.unit_price)}</td><td class="r">${money(i.discount_amt)}</td><td class="r">${money(i.line_total)}</td></tr>`).join('')}</table></div><p class="r" style="margin-top:10px">Subtotal ${money(o.subtotal)} · Discount ${money(o.discount_total)}${o.bill_discount_amt > 0 ? ` (incl. ${qn(o.bill_discount_pct)}% bill discount ${money(o.bill_discount_amt)})` : ''}<br><b>Total ${rs(o.total)}</b> · Paid ${money(o.paid)}</p>${o.cancel_reason ? `<div class="err">Cancelled: ${esc(o.cancel_reason)}</div>` : ''}<div class="row"><span class="sp"></span><button class="btn" onclick="closeModal()">Close</button></div>`, true); }
     if (c) { const m = modal(`<h3>Cancel ${esc(e.target.dataset.n)}?</h3><p class="mut" style="margin-bottom:10px">Stock will be restored. This is recorded in the activity log.</p><div class="f"><label>Reason</label><input id="cr"></div><div class="row"><span class="sp"></span><button class="btn" onclick="closeModal()">Keep</button><button class="btn bad" id="cy">Cancel order</button></div>`);
       $('#cy', m).onclick = ev => guard(ev.target, async () => { await api(`/orders/${c}/cancel`, { method: 'POST', body: { reason: $('#cr').value } }); closeModal(); toast('Order cancelled'); load(); }); } };
 }
@@ -259,7 +267,7 @@ async function vReports() {
   $('#ra').onclick = run; $$('[data-q]').forEach(b => b.onclick = () => { const q = b.dataset.q; $('#rt').value = today; $('#rf').value = q === 'm' ? today.slice(0, 8) + '01' : q === 'y' ? today.slice(0, 5) + '01-01' : dd(+q); run(); }); await run();
 }
 function draw(d) {
-  const r = d.range_stats; $('#rbody').innerHTML = cards(d) + `<div class="grid g5" style="margin-bottom:14px">${stat('Revenue', rs(r.revenue))}${stat('Orders', r.orders, r.cancelled + ' cancelled')}${stat('Avg order', rs(r.avg_order))}${stat('Discounts', rs(r.discounts))}${stat('Outstanding credit', rs(d.outstanding), r.paid_orders + ' paid · ' + r.unpaid_orders + ' unpaid/partial')}</div>
+  const r = d.range_stats; $('#rbody').innerHTML = cards(d) + `<div class="grid g5" style="margin-bottom:14px">${stat('Revenue', rs(r.revenue))}${stat('Orders', r.orders, r.cancelled + ' cancelled')}${stat('Avg order', rs(r.avg_order))}${stat('Discounts', rs(r.discounts), r.bill_discounts > 0 ? 'incl. bill discounts ' + rs(r.bill_discounts) : '')}${stat('Outstanding credit', rs(d.outstanding), r.paid_orders + ' paid · ' + r.unpaid_orders + ' unpaid/partial')}</div>
   <div class="card"><div class="row"><h3 class="sp" style="margin:0">Sales trend</h3><div class="tabs" id="tb">${['day', 'week', 'month', 'year'].map((k, i) => `<button data-k="${k}" class="${i ? '' : 'on'}">${k[0].toUpperCase() + k.slice(1)}ly</button>`).join('').replace('Dayly', 'Daily')}</div></div><div class="chartbox"><canvas id="t1"></canvas></div></div>
   <div class="grid g2"><div class="card"><h3>Best-selling products</h3><div class="chartbox"><canvas id="t2"></canvas></div></div><div class="card"><h3>Payment methods</h3><div class="chartbox"><canvas id="t3"></canvas></div></div></div>
   <div class="grid g2"><div class="card"><h3>Lowest-selling products</h3><div class="tw"><table><tr><th>Product</th><th class="r">Qty</th><th class="r">Revenue</th></tr>${[...d.products].reverse().slice(0, 10).map(p => `<tr><td>${esc(p.name)}</td><td class="r">${qn(p.qty)}</td><td class="r mono">${money(p.revenue)}</td></tr>`).join('')}</table></div></div>
@@ -269,6 +277,19 @@ function draw(d) {
   tr('day'); $('#tb').onclick = e => { const k = e.target.dataset.k; if (!k) return; $$('#tb button').forEach(b => b.classList.toggle('on', b === e.target)); tr(k); };
   const top = d.products.filter(p => p.qty > 0).slice(0, 8); chart('t2', { type: 'bar', data: { labels: top.map(p => p.name.slice(0, 18)), datasets: [{ label: 'Qty', data: top.map(p => p.qty), backgroundColor: '#16a34a', borderRadius: 4 }] }, options: { indexAxis: 'y', plugins: { legend: { display: false } } } });
   chart('t3', { type: 'doughnut', data: { labels: d.payments.map(p => p.method), datasets: [{ data: d.payments.map(p => p.revenue), backgroundColor: palette }] } });
+}
+
+
+// ───────── automatic bill discounts (owner) ─────────
+async function vDiscounts() {
+  const rules = await api('/discount-rules');
+  $('#main').innerHTML = head('Discounts', 'Automatic bill discounts — applied at checkout without the cashier doing anything', '<button class="btn pri" id="nr">＋ Add rule</button>') +
+    `<div class="card" style="background:#f8fafc"><b>How it works</b><p class="mut" style="margin-top:4px">When a bill (after product discounts, before tax) reaches the <b>minimum amount</b>, the <b>percentage</b> is taken off the whole bill automatically. If several rules match, only the biggest discount is used (they never add together). Each invoice shows the discount on its own line, and every use is recorded in the Activity Log.</p></div>
+    <div class="card tw"><table id="rt"><tr><th>Rule name</th><th class="r">Minimum bill (Rs.)</th><th class="r">Discount</th><th>Status</th><th></th></tr>${rules.map(r => `<tr style="${r.active ? '' : 'opacity:.55'}"><td><b>${esc(r.name)}</b></td><td class="r mono">${money(r.min_amount)}</td><td class="r"><span class="badge ok">${qn(r.percent)}%</span></td><td><span class="badge ${r.active ? 'ok' : ''}">${r.active ? 'active' : 'disabled'}</span></td><td class="r"><button class="btn sm" data-e="${r.id}">Edit</button> <button class="btn sm" data-t="${r.id}">${r.active ? 'Disable' : 'Enable'}</button> <button class="btn sm bad" data-x="${r.id}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="mut" style="padding:24px;text-align:center">No rules yet.<br><br><button class="btn pri" id="q5">＋ Add: 5% off bills of Rs. 5,000 or more</button></td></tr>'}</table></div>`;
+  const form = r => { const o = modal(`<h3>${r ? 'Edit' : 'New'} discount rule</h3><div class="f"><label>Rule name (optional)</label><input id="rn" value="${esc(r?.name)}" placeholder="e.g. Bulk bill 5%"></div><div class="grid g2"><div class="f"><label>Minimum bill amount (Rs.)</label><input id="rm" type="number" step="0.01" min="0" value="${r?.min_amount ?? 5000}"></div><div class="f"><label>Discount %</label><input id="rp" type="number" step="0.01" min="0.01" max="100" value="${r?.percent ?? 5}"></div></div><div class="row"><span class="sp"></span><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pri" id="rs2">Save rule</button></div>`);
+    $('#rs2', o).onclick = e => guard(e.target, async () => { const body = { name: $('#rn').value, min_amount: $('#rm').value, percent: $('#rp').value }; await api(r ? '/discount-rules/' + r.id : '/discount-rules', { method: r ? 'PATCH' : 'POST', body }); closeModal(); toast('Rule saved', 'ok'); route(); }); };
+  $('#nr').onclick = () => form(); const q5 = $('#q5'); if (q5) q5.onclick = e => guard(e.target, async () => { await api('/discount-rules', { method: 'POST', body: { name: '5% off bills of Rs. 5,000+', min_amount: 5000, percent: 5 } }); toast('Rule added', 'ok'); route(); });
+  $('#rt').onclick = async e => { const t = e.target.dataset; if (t.e) form(rules.find(r => r.id == t.e)); if (t.t) { const r = rules.find(x => x.id == t.t); await api('/discount-rules/' + r.id, { method: 'PATCH', body: { active: !r.active } }).catch(er => toast(er.message, 'err')); route(); } if (t.x) { if (!confirm('Delete this rule? Past invoices are not affected.')) return; await api('/discount-rules/' + t.x, { method: 'DELETE' }).catch(er => toast(er.message, 'err')); route(); } };
 }
 
 // ───────── users ─────────
@@ -294,10 +315,12 @@ async function vLogs() {
 // ───────── settings (owner) ─────────
 async function vSettings() {
   const c = (await api('/me')).settings; S.cfg = c; const f = (id, l, v, t = 'text') => `<div class="f"><label>${l}</label><input id="${id}" type="${t}" value="${esc(v)}"></div>`;
-  $('#main').innerHTML = head('Settings', 'Business details used on invoices') + `<div class="grid g2"><div class="card"><h3>Business</h3>${f('s1', 'Business name', c.business_name)}${f('s2', 'Address', c.business_address)}${f('s3', 'Phone', c.business_phone)}${f('s4', 'Route / branch name (shown on 57mm receipt)', c.route_name)}${f('s5', 'Receipt footer', c.receipt_footer)}<div class="grid g2">${f('s6', 'Time zone offset (minutes from UTC; Sri Lanka = 330)', c.tz_offset, 'number')}${f('s7', 'Low-stock warning below', c.low_stock, 'number')}</div>
+  $('#main').innerHTML = head('Settings', 'Business details used on invoices') + `<div class="grid g2"><div class="card"><h3>Business</h3>${f('s1', 'Business name', c.business_name)}${f('s2', 'Address', c.business_address)}${f('s3', 'Phone', c.business_phone)}${f('s4', 'Route / branch name (shown on 57mm receipt)', c.route_name)}${f('s5', 'Receipt footer', c.receipt_footer)}${f('s10', 'Business e-mail (shown on A4 invoices)', c.business_email)}<div class="f"><label>Bank details (shown on A4 invoices — one item per line)</label><textarea id="s11" rows="3" maxlength="400" placeholder="Bank: …&#10;Account number: …">${esc(c.bank_details)}</textarea></div><div class="grid g2">${f('s6', 'Time zone offset (minutes from UTC; Sri Lanka = 330)', c.tz_offset, 'number')}${f('s7', 'Low-stock warning below', c.low_stock, 'number')}</div>
   <div class="f"><label>Logo (PNG or JPEG — resized automatically)</label><input type="file" id="s8" accept="image/png,image/jpeg">${c.logo ? `<img src="${esc(c.logo)}" style="height:48px;margin-top:8px"> <button class="btn sm bad" id="s9">Remove logo</button>` : ''}</div><button class="btn pri" id="sv">Save settings</button></div>
+  <div class="card"><h3>Recent server errors</h3><div id="errs"><p class="mut">Loading…</p></div></div>
   <div class="card"><h3>Data safety</h3><p class="mut" style="margin-bottom:10px">Everything (orders, A4 invoice PDFs, products, users) is stored in your cloud PostgreSQL database, which keeps its own backups and history — see your database provider's dashboard to restore. As an extra safety copy you can download all business data here.</p><a class="btn pri" href="/api/export">⬇ Download full data export (JSON)</a><p class="mut" style="margin-top:10px;font-size:12px">Invoice PDFs already issued are never changed when you edit business details, so old invoices stay exactly as they were printed.</p></div></div>`;
-  const save = async extra => { const b = { business_name: $('#s1').value, business_address: $('#s2').value, business_phone: $('#s3').value, route_name: $('#s4').value, receipt_footer: $('#s5').value, tz_offset: $('#s6').value, low_stock: $('#s7').value, ...extra }; S.cfg = await api('/settings', { method: 'PATCH', body: b }); toast('Settings saved', 'ok'); shell(); };
+  api('/errors').then(er => { const h = $('#errs'); if (!h) return; h.innerHTML = er.length ? `<div class="tw"><table>${er.map(x => `<tr><td class="mut" style="white-space:nowrap">${ldate(x.created_at)}</td><td><b>${esc(x.context)}</b><br><span class="mut" style="font-size:12px;word-break:break-word">${esc(String(x.message).split('\n')[0].slice(0, 220))}</span></td></tr>`).join('')}</table></div>` : '<p class="mut">No errors recorded. 🎉</p>'; }).catch(() => {});
+  const save = async extra => { const b = { business_name: $('#s1').value, business_address: $('#s2').value, business_phone: $('#s3').value, business_email: $('#s10').value, bank_details: $('#s11').value, route_name: $('#s4').value, receipt_footer: $('#s5').value, tz_offset: $('#s6').value, low_stock: $('#s7').value, ...extra }; S.cfg = await api('/settings', { method: 'PATCH', body: b }); toast('Settings saved', 'ok'); shell(); };
   $('#sv').onclick = e => guard(e.target, () => save()); const rm = $('#s9'); if (rm) rm.onclick = async () => { S.cfg = await api('/settings/logo', { method: 'DELETE' }); toast('Logo removed'); shell(); };
   $('#s8').onchange = async e => { const f2 = e.target.files[0]; if (!f2) return; try { S.cfg = await upload('/settings/logo', await shrink(f2, 400, 'image/png')); toast('Logo saved', 'ok'); shell(); } catch (er) { toast(er.message, 'err'); } };
 }
