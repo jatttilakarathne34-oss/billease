@@ -419,6 +419,7 @@ app.get('/api/logs', auth, need('logs.view'), wrap(async (req, res) => {
   const own = req.user.role === 'owner';
   res.json(await D.all(`SELECT l.*,u.role FROM activity_logs l LEFT JOIN users u ON u.id=l.user_id WHERE (l.action ILIKE @q OR COALESCE(l.username,'') ILIKE @q OR COALESCE(l.detail,'') ILIKE @q) ${own ? '' : "AND COALESCE(u.role,'')<>'owner'"} ORDER BY l.id DESC LIMIT 300`, { q: `%${str(req.query.q, 40)}%` }));
 }));
+app.get('/api/errors', auth, ownerOnly, wrap(async (req, res) => res.json(await D.all('SELECT id,context,message,created_at FROM error_logs ORDER BY id DESC LIMIT 30'))));
 app.patch('/api/settings', auth, ownerOnly, wrap(async (req, res) => {
   const b = req.body || {}, keys = ['business_name', 'business_address', 'business_phone', 'receipt_footer', 'route_name', 'tz_offset', 'low_stock'];
   for (const k of keys) if (b[k] !== undefined) {

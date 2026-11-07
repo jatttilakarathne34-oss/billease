@@ -1,5 +1,8 @@
 'use strict';
 const PDFDocument = require('pdfkit');
+// PDFKit loads its built-in fonts through an alias that serverless bundlers (Vercel) cannot see, so the files would be left out and every PDF would fail.
+// Requiring them explicitly makes the bundler include them. Fonts used: Helvetica, Helvetica-Bold, Helvetica-Oblique.
+require('pdfkit/standard-fonts/Helvetica'); require('pdfkit/standard-fonts/HelveticaBold'); require('pdfkit/standard-fonts/HelveticaOblique');
 const m = n => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const getLogo = S => S.logo_buf || logoBuf(S.logo);
 const logoBuf = s => { const x = /^data:image\/(png|jpeg);base64,(.+)$/.exec(s || ''); return x ? Buffer.from(x[2], 'base64') : null; };
