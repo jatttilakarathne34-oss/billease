@@ -13,74 +13,58 @@ function local(utc, off) {
 }
 const q = v => (Math.round(v * 1000) / 1000).toString();
 
-// ---------- A4 (formal business invoice layout) ----------
+// ---------- A4 ----------
 function a4(o, S) {
-  const doc = new PDFDocument({ size: 'A4', margin: 0, info: { Title: o.invoice_no, Author: S.business_name || 'Business' } });
+  const doc = new PDFDocument({ size: 'A4', margin: 40, info: { Title: o.invoice_no, Author: S.business_name } });
   const off = parseInt(S.tz_offset || '330'), t = local(o.created_at, off), lg = getLogo(S);
-  const L = 40, R = 555, W = R - L, GRAY = '#666666';
-  const font = (b, sz, c = '#000000') => doc.font(b ? 'Helvetica-Bold' : 'Helvetica').fontSize(sz).fillColor(c);
-  const clip = (s, w) => { s = String(s ?? ''); if (doc.widthOfString(s) <= w) return s; while (s.length > 1 && doc.widthOfString(s + '...') > w) s = s.slice(0, -1); return s.trimEnd() + '...'; };
-  const one = (s, x, y, w, al = 'left') => doc.text(clip(s, w), x, y, { width: w + 2, align: al, lineBreak: false });
-  const lines = (s, max) => String(s || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean).slice(0, max);
-  const wrapped = (s, x, y, w, h) => { doc.text(String(s), x, y, { width: w, height: h, ellipsis: true }); return doc.y; };
-  const walkin = !o.customer_name || o.customer_name === 'Walk-in Customer';
-
-  // header: company (left), INVOICE title
-  let tx = L; if (lg) { try { doc.image(lg, L, 34, { fit: [46, 46] }); tx = L + 54; } catch {} }
-  font(1, 13); one(S.business_name || 'Business', tx, 38, 235);
-  font(0, 7, GRAY); let ay = 56; for (const ln of [...lines(S.business_address, 3), S.business_phone, S.business_email].filter(Boolean)) ay = wrapped(ln, tx, ay, 235, 18) + 1;
-  font(1, 15); one('INVOICE', 313, 38, 240);
-
-  // recipient (left) + grey info box (right)
-  font(1, 9); one('Recipient:', L, 128, 240); font(0, 9.5); one(walkin ? 'Walk-in Customer' : o.customer_name, L, 142, 240);
-  let ry = 156; font(0, 9); if (o.customer_phone) { one(o.customer_phone, L, ry, 240); ry += 12; } if (o.customer_address) doc.text(o.customer_address, L, ry, { width: 240 });
-  const rows = [['Invoice date', `${t.date}  ${t.time}`], ['Invoice number', o.invoice_no], ['Customer number', o.customer_id ? String(o.customer_id).padStart(4, '0') : '-'], ['Served by', o.employee], ['Payment method', o.payment_method[0].toUpperCase() + o.payment_method.slice(1)]];
-  const bx = 311, bw = R - bx, by = 118; doc.rect(bx, by, bw, rows.length * 13 + 12).fill('#efefef');
-  rows.forEach(([k, v], i) => { font(0, 9); one(k, bx, by + 8 + i * 13, 122, 'right'); font(i === 1 ? 1 : 0, 9); one(v, bx + 130, by + 8 + i * 13, bw - 134); });
-
-  // greeting
-  font(0, 9.5); one(`Dear ${walkin ? 'Customer' : o.customer_name},`, L, 216, W); one('Thank you for your order. We hereby invoice you for the following products:', L, 238, W);
-
-  // items table: grey header, ruled columns, tall frame
-  const X = [L, 255, 310, 390, 465, R], TOP = 268, ROW = 15, MINB = 560, MAXB = 700;
-  const footer = () => {
-    const y = 772; doc.lineWidth(0.8).strokeColor('#555555').moveTo(L, y).lineTo(R, y).stroke();
-    const cols = [[S.business_name || 'Business', ...lines(S.business_address, 3)]];
-    if (S.bank_details) cols.push(['Bank details', ...String(S.bank_details).split(/\r?\n/).map(x => x.trim()).filter(Boolean).slice(0, 4)]);
-    const ct = [S.business_phone && 'Tel.: ' + S.business_phone, S.business_email && 'E-mail: ' + S.business_email].filter(Boolean); if (ct.length) cols.push(['Contact information', ...ct]);
-    const cw = W / cols.length;
-    cols.forEach((c, i) => { let cy = y + 6; font(1, 7.5); one(c[0], L + i * cw, cy, cw - 10); cy += 11; font(0, 7, '#333333'); for (const ln of c.slice(1)) cy = wrapped(ln, L + i * cw, cy, cw - 10, 18) + 0.5; });
+  if (lg) { try { doc.image(lg, 40, 38, { fit: [64, 64] }); } catch {} }
+  const tx = lg ? 114 : 40;
+  doc.fillColor('#111').font('Helvetica-Bold').fontSize(19).text(S.business_name || 'Business', tx, 40, { width: 330 });
+  doc.font('Helvetica').fontSize(9).fillColor('#555').text([S.business_address, S.business_phone].filter(Boolean).join('\n'), tx, doc.y + 2, { width: 330 });
+  doc.font('Helvetica-Bold').fontSize(22).fillColor('#1d4ed8').text('INVOICE', 380, 40, { width: 175, align: 'right' });
+  doc.font('Helvetica').fontSize(9.5).fillColor('#111')
+    .text(`No: ${o.invoice_no}`, 380, 68, { width: 175, align: 'right' })
+    .text(`Date: ${t.date}  ${t.time}`, { width: 175, align: 'right' })
+    .text(`Served by: ${o.employee}`, { width: 175, align: 'right' })
+    .text(`Payment: ${o.payment_method.toUpperCase()}`, { width: 175, align: 'right' });
+  let y = 122;
+  doc.moveTo(40, y).lineTo(555, y).strokeColor('#d1d5db').stroke(); y += 10;
+  doc.font('Helvetica-Bold').fontSize(9).fillColor('#6b7280').text('BILL TO', 40, y);
+  doc.font('Helvetica').fontSize(10.5).fillColor('#111').text(o.customer_name || 'Walk-in Customer', 40, y + 13);
+  if (o.customer_phone) doc.fontSize(9.5).fillColor('#444').text(o.customer_phone);
+  if (o.customer_address) doc.text(o.customer_address, { width: 300 });
+  y = Math.max(doc.y, y + 40) + 12;
+  const X = [40, 62, 300, 360, 440, 495], head = () => {
+    doc.rect(40, y, 515, 22).fill('#1e293b'); doc.fillColor('#fff').font('Helvetica-Bold').fontSize(9);
+    doc.text('#', X[0] + 4, y + 7).text('Item', X[1], y + 7).text('Qty', X[2], y + 7, { width: 50, align: 'right' })
+      .text('Unit Price', X[3], y + 7, { width: 70, align: 'right' }).text('Disc.', X[4], y + 7, { width: 50, align: 'right' })
+      .text('Amount', X[5], y + 7, { width: 55, align: 'right' });
+    y += 22;
   };
-  const frame = (top, bottom) => { doc.lineWidth(0.8).strokeColor('#000000').rect(L, top, W, bottom - top).stroke(); for (const x of X.slice(1, -1)) doc.moveTo(x, top).lineTo(x, bottom).stroke(); };
-  const head = y => {
-    doc.rect(L, y, W, 15).fill('#bfbfbf'); font(1, 8.5);
-    one('Description', L + 4, y + 4, X[1] - L - 8); [['Quantity', 1], ['Price (Rs.)/unit', 2], ['Discount', 3], ['Total (Rs.)', 4]].forEach(([h, i]) => one(h, X[i], y + 4, X[i + 1] - X[i] - 5, 'right'));
-  };
-  let y = TOP, top = TOP; head(y); y += 15;
-  for (const i of o.items) {
-    if (y + ROW > MAXB) { frame(top, y); footer(); doc.addPage(); top = y = 50; head(y); y += 15; }
-    font(0, 8.5, i.is_return ? '#b91c1c' : '#000000');
-    one((i.is_return ? '[RETURN] ' : '') + i.name, L + 4, y + 4, X[1] - L - 8); one(q(i.qty), X[1], y + 4, X[2] - X[1] - 5, 'right'); one(m(i.unit_price), X[2], y + 4, X[3] - X[2] - 5, 'right');
-    one(i.discount_amt ? `${q(i.discount_pct)}%  ${m(i.discount_amt)}` : '-', X[3], y + 4, X[4] - X[3] - 5, 'right'); one(m(i.line_total), X[4], y + 4, X[5] - X[4] - 5, 'right'); y += ROW;
-  }
-  const bottom = Math.max(y, top === TOP ? MINB : y); frame(top, bottom); y = bottom + 14;
-
-  // totals (right)
-  if (y + 150 > 760) { footer(); doc.addPage(); y = 50; }
-  const tr = (l, v, b, sz = 9.5, c = '#000000') => { font(b, sz, c); one(l, 330, y, 130); one(v, 455, y, R - 455, 'right'); y += sz + 5; };
-  const net = o.subtotal - o.discount_total;
-  if (o.discount_total > 0.005) { tr('Subtotal', m(o.subtotal)); tr('Discount', '- ' + m(o.discount_total)); }
-  tr('Net amount', m(net), 1); tr('Sales tax', m(o.tax_total), 1);
-  doc.lineWidth(0.8).strokeColor('#000000').moveTo(330, y).lineTo(R, y).stroke().moveTo(330, y + 2).lineTo(R, y + 2).stroke(); y += 9;
-  tr('Invoice total (Rs.)', m(o.total), 1, 11.5); y += 2;
-  tr('Paid', m(o.paid)); if (o.total - o.paid > 0.005) tr('Balance due', m(o.total - o.paid), 1, 9.5, '#b91c1c'); if (o.prev_outstanding > 0.005) tr('Previous outstanding', m(o.prev_outstanding));
-
-  // closing
-  y = Math.max(y + 22, 700); if (y + 36 > 764) { footer(); doc.addPage(); y = 60; }
-  if (o.note) { font(0, 8.5, GRAY); one('Note: ' + o.note, L, y - 22, 300); }
-  font(0, 9.5); one('Thank you for your business', L, y, W); one(S.business_name || '', L, y + 22, W);
-  footer();
-  if (o.status === 'cancelled') { doc.save().rotate(-30, { origin: [300, 420] }).opacity(0.18).font('Helvetica-Bold').fontSize(90).fillColor('#dc2626').text('CANCELLED', 40, 380, { width: 520, align: 'center', lineBreak: false }).restore(); }
+  head();
+  o.items.forEach((i, n) => {
+    if (y > 740) { doc.addPage(); y = 40; head(); }
+    const sg = i.is_return ? -1 : 1;
+    doc.font('Helvetica').fontSize(9.5).fillColor(i.is_return ? '#b91c1c' : '#111');
+    doc.text(String(n + 1), X[0] + 4, y + 6).text((i.is_return ? '[RETURN] ' : '') + i.name, X[1], y + 6, { width: 230, lineBreak: false, ellipsis: true })
+      .text(q(i.qty), X[2], y + 6, { width: 50, align: 'right' }).text(m(i.unit_price), X[3], y + 6, { width: 70, align: 'right' })
+      .text(i.discount_amt ? `${m(i.discount_amt * sg)} (${q(i.discount_pct)}%)` : '-', X[4] - 20, y + 6, { width: 70, align: 'right' })
+      .text(m(i.line_total), X[5], y + 6, { width: 55, align: 'right' });
+    y += 22; doc.moveTo(40, y).lineTo(555, y).strokeColor('#e5e7eb').stroke();
+  });
+  if (y > 640) { doc.addPage(); y = 40; }
+  y += 14;
+  const row = (l, v, b, c) => { doc.font(b ? 'Helvetica-Bold' : 'Helvetica').fontSize(b ? 12 : 10).fillColor(c || '#111').text(l, 340, y, { width: 110 }).text(v, 450, y, { width: 105, align: 'right' }); y += b ? 22 : 17; };
+  row('Subtotal', m(o.subtotal)); row('Total Discount', '- ' + m(o.discount_total));
+  if (o.tax_total) row('Tax', m(o.tax_total));
+  doc.moveTo(340, y).lineTo(555, y).strokeColor('#111').stroke(); y += 6;
+  row('Total Payable', 'Rs. ' + m(o.total), true, '#1d4ed8');
+  row('Paid', m(o.paid));
+  if (o.total - o.paid > 0.005) row('Balance Due', m(o.total - o.paid), true, '#b91c1c');
+  if (o.prev_outstanding > 0.005) row('Previous Outstanding', m(o.prev_outstanding));
+  if (o.note) doc.font('Helvetica-Oblique').fontSize(9).fillColor('#555').text('Note: ' + o.note, 40, y + 10, { width: 280 });
+  doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(S.receipt_footer || 'Thank you for your business!', 40, 790, { width: 515, align: 'center' });
+  if (o.status === 'cancelled') { doc.save().rotate(-30, { origin: [300, 420] }).opacity(0.18).font('Helvetica-Bold').fontSize(90).fillColor('#dc2626').text('CANCELLED', 40, 380, { width: 520, align: 'center' }).restore(); }
   doc.end(); return doc;
 }
 

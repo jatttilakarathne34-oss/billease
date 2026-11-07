@@ -42,7 +42,7 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;
 CREATE TABLE IF NOT EXISTS images(id TEXT PRIMARY KEY, content_type TEXT NOT NULL, data BYTEA NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS ix_orders_created ON orders(created_at); CREATE INDEX IF NOT EXISTS ix_orders_user ON orders(user_id); CREATE INDEX IF NOT EXISTS ix_orders_cust ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_items_order ON order_items(order_id); CREATE INDEX IF NOT EXISTS ix_pay_cust ON payments(customer_id); CREATE INDEX IF NOT EXISTS ix_logs_created ON activity_logs(created_at);`;
-const DEFAULT_SET = { business_name: 'My Business', business_address: '', business_phone: '', business_email: '', bank_details: '', receipt_footer: 'Thank you!', route_name: '', tz_offset: '330', low_stock: '10', logo: '', invoice_seq: '0' };
+const DEFAULT_SET = { business_name: 'My Business', business_address: '', business_phone: '', receipt_footer: 'Thank you!', route_name: '', tz_offset: '330', low_stock: '10', logo: '', invoice_seq: '0' };
 function explainDbError(e) { // plain-language reason; never includes passwords or connection strings
   const m = String(e && e.message || ''), c = e && e.code;
   let t;
@@ -421,10 +421,10 @@ app.get('/api/logs', auth, need('logs.view'), wrap(async (req, res) => {
 }));
 app.get('/api/errors', auth, ownerOnly, wrap(async (req, res) => res.json(await D.all('SELECT id,context,message,created_at FROM error_logs ORDER BY id DESC LIMIT 30'))));
 app.patch('/api/settings', auth, ownerOnly, wrap(async (req, res) => {
-  const b = req.body || {}, keys = ['business_name', 'business_address', 'business_phone', 'business_email', 'bank_details', 'receipt_footer', 'route_name', 'tz_offset', 'low_stock'];
+  const b = req.body || {}, keys = ['business_name', 'business_address', 'business_phone', 'receipt_footer', 'route_name', 'tz_offset', 'low_stock'];
   for (const k of keys) if (b[k] !== undefined) {
     let v = String(b[k]);
-    if (k === 'tz_offset') v = String(num(v, -720, 840, 'Time zone offset')); else if (k === 'low_stock') v = String(num(v, 0, 1e6, 'Low stock')); else v = str(v, k === 'bank_details' ? 400 : 200);
+    if (k === 'tz_offset') v = String(num(v, -720, 840, 'Time zone offset')); else if (k === 'low_stock') v = String(num(v, 0, 1e6, 'Low stock')); else v = str(v, 200);
     await setS(k, v);
   }
   await A(req, 'settings.update', 'settings', null, Object.keys(b).filter(k => keys.includes(k)).join(',')); res.json(await pubSettings());
