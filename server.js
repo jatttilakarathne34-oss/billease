@@ -436,6 +436,13 @@ app.get('/api/export', auth, ownerOnly, wrap(async (req, res) => {
 }));
 
 // ───────── static (local only; on Vercel the public/ folder is served by the CDN) & errors ─────────
+// The web pages are served from assets.js (generated from public/), so the app works even if the host does not publish the public/ folder.
+let ASSETS = {}; try { ASSETS = require('./assets'); } catch {}
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  const a = ASSETS[req.path === '/' ? '/index.html' : req.path]; if (!a) return next();
+  res.set({ 'Content-Type': a.type, 'Cache-Control': req.path.startsWith('/vendor/') ? 'public, max-age=86400' : 'no-cache' }); res.send(a.body);
+});
 app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((e, req, res, next) => {
