@@ -8,7 +8,7 @@ const { createDb, dbUrl } = require('./db');
 const storage = require('./storage');
 
 let D, SECRET;
-const SCHEMA_VERSION = '3';
+const SCHEMA_VERSION = '5';
 const logErr = (e, ctx = '') => { console.error(`[${ctx}]`, (e && e.stack) || e); if (D) D.run('INSERT INTO error_logs(context,message) VALUES(@c,@m)', { c: String(ctx).slice(0, 200), m: String((e && e.stack) || e).slice(0, 2000) }).catch(() => {}); };
 process.on('unhandledRejection', e => logErr(e, 'unhandled'));
 
@@ -45,9 +45,20 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_discount_amt DOUBLE PRECISION N
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_discount_name TEXT;
 CREATE TABLE IF NOT EXISTS discount_rules(id SERIAL PRIMARY KEY, name TEXT NOT NULL, min_amount DOUBLE PRECISION NOT NULL CHECK(min_amount>=0), percent DOUBLE PRECISION NOT NULL CHECK(percent>0 AND percent<=100),
   active INTEGER NOT NULL DEFAULT 1, created_by INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS routes(id SERIAL PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE UNIQUE INDEX IF NOT EXISTS ux_routes_name ON routes(lower(name));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS route_id INTEGER REFERENCES routes(id);
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS route_id INTEGER REFERENCES routes(id);
+CREATE INDEX IF NOT EXISTS ix_customers_route ON customers(route_id);
+CREATE TABLE IF NOT EXISTS sales_returns(id SERIAL PRIMARY KEY, return_no TEXT UNIQUE NOT NULL, client_ref TEXT UNIQUE NOT NULL, order_id INTEGER NOT NULL REFERENCES orders(id), customer_id INTEGER REFERENCES customers(id), customer_name TEXT,
+  user_id INTEGER NOT NULL REFERENCES users(id), subtotal DOUBLE PRECISION NOT NULL, discount_total DOUBLE PRECISION NOT NULL DEFAULT 0, tax_total DOUBLE PRECISION NOT NULL DEFAULT 0, total DOUBLE PRECISION NOT NULL,
+  refund_method TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'completed', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), cancelled_at TIMESTAMPTZ, cancelled_by INTEGER REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS sales_return_items(id SERIAL PRIMARY KEY, return_id INTEGER NOT NULL REFERENCES sales_returns(id), order_item_id INTEGER NOT NULL REFERENCES order_items(id), product_id INTEGER NOT NULL REFERENCES products(id), name TEXT NOT NULL,
+  qty DOUBLE PRECISION NOT NULL CHECK(qty>0), unit_price DOUBLE PRECISION NOT NULL, gross DOUBLE PRECISION NOT NULL, discount_amt DOUBLE PRECISION NOT NULL DEFAULT 0, tax_amt DOUBLE PRECISION NOT NULL DEFAULT 0, line_total DOUBLE PRECISION NOT NULL, restock INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS ix_returns_order ON sales_returns(order_id); CREATE INDEX IF NOT EXISTS ix_returns_cust ON sales_returns(customer_id); CREATE INDEX IF NOT EXISTS ix_return_items_return ON sales_return_items(return_id);
 CREATE INDEX IF NOT EXISTS ix_orders_created ON orders(created_at); CREATE INDEX IF NOT EXISTS ix_orders_user ON orders(user_id); CREATE INDEX IF NOT EXISTS ix_orders_cust ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_items_order ON order_items(order_id); CREATE INDEX IF NOT EXISTS ix_pay_cust ON payments(customer_id); CREATE INDEX IF NOT EXISTS ix_logs_created ON activity_logs(created_at);`;
-const DEFAULT_SET = { business_name: 'My Business', business_address: '', business_phone: '', business_email: '', bank_details: '', receipt_footer: 'Thank you!', route_name: '', tz_offset: '330', low_stock: '10', logo: '', invoice_seq: '0' };
+const DEFAULT_SET = { business_name: 'My Business', business_address: '', return_seq: '0', business_phone: '', business_email: '', bank_details: '', receipt_footer: 'Thank you!', route_name: '', tz_offset: '330', low_stock: '10', logo: '', invoice_seq: '0' };
 function explainDbError(e) { // plain-language reason; never includes passwords or connection strings
   const m = String(e && e.message || ''), c = e && e.code;
   let t;
@@ -79,7 +90,7 @@ let _cfg = null, _cfgT = 0;
 async function cfg() { if (_cfg && Date.now() - _cfgT < 5000) return _cfg; const o = Object.fromEntries((await D.all('SELECT key,value FROM settings')).map(r => [r.key, r.value])); _cfg = o; _cfgT = Date.now(); return o; }
 const getS = async k => (await D.get('SELECT value FROM settings WHERE key=@k', { k }))?.value ?? null;
 const setS = async (k, v) => { await D.run('INSERT INTO settings(key,value) VALUES(@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value', { k, v: String(v) }); _cfg = null; };
-const pubSettings = async () => { const o = { ...(await cfg()) }; delete o.jwt_secret; delete o.invoice_seq; delete o.schema_version; return o; };
+const pubSettings = async () => { const o = { ...(await cfg()) }; delete o.jwt_secret; delete o.invoice_seq; delete o.return_seq; delete o.schema_version; return o; };
 const pdfSettings = async () => { const S = await pubSettings(); S.logo_buf = await storage.imageBytes(D, S.logo); return S; };
 const offMin = async () => parseInt((await cfg()).tz_offset ?? '330') || 0;
 const today = async () => new Date(Date.now() + (await offMin()) * 60000).toISOString().slice(0, 10);
@@ -98,10 +109,10 @@ const A = async (req, action, entity, id, detail) => { try { await D.run('INSERT
 const toBuf = doc => new Promise((ok, no) => { const c = []; doc.on('data', x => c.push(x)); doc.on('end', () => ok(Buffer.concat(c))); doc.on('error', no); });
 
 // ───────── roles & permissions ─────────
-const ALL = ['pos.sell', 'pos.discount', 'discounts.manage', 'orders.view_all', 'orders.view_own', 'orders.cancel', 'products.view', 'products.manage', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'];
+const ALL = ['pos.sell', 'pos.discount', 'discounts.manage', 'orders.delete', 'returns.create', 'routes.manage', 'orders.view_all', 'orders.view_own', 'orders.cancel', 'products.view', 'products.manage', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'];
 const DEF = {
   owner: ALL,
-  manager: ['pos.sell', 'pos.discount', 'orders.view_all', 'orders.view_own', 'products.view', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view'],
+  manager: ['pos.sell', 'pos.discount', 'orders.view_all', 'orders.view_own', 'products.view', 'inventory.manage', 'customers.manage', 'creditors.manage', 'reports.view', 'reports.export', 'users.manage', 'logs.view', 'routes.manage', 'returns.create'],
   employee: ['pos.sell', 'orders.view_own']
 };
 function effectivePerms(u) {
@@ -111,7 +122,7 @@ function effectivePerms(u) {
   if (u.role !== 'manager') p = p.filter(k => k !== 'users.manage');
   return p;
 }
-const pubUser = u => ({ id: u.id, username: u.username, name: u.name, role: u.role, active: !!u.active, created_at: u.created_at, last_login: u.last_login, permissions: effectivePerms(u) });
+const pubUser = u => ({ route_id: u.route_id ?? null, route_name: u.route_name ?? null, id: u.id, username: u.username, name: u.name, role: u.role, active: !!u.active, created_at: u.created_at, last_login: u.last_login, permissions: effectivePerms(u) });
 
 // ───────── app ─────────
 const app = express(); app.set('trust proxy', true); app.disable('x-powered-by');
@@ -124,7 +135,7 @@ async function auth(req, res, next) {
   try {
     const t = req.cookies.token; if (!t) return res.status(401).json({ error: 'Please sign in' });
     let p; try { p = jwt.verify(t, SECRET); } catch { return res.status(401).json({ error: 'Session expired' }); }
-    const u = await D.get('SELECT * FROM users WHERE id=@id', { id: p.id });
+    const u = await D.get('SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id WHERE u.id=@id', { id: p.id });
     if (!u || !u.active) return res.status(401).json({ error: 'Account disabled' });
     req.user = u; req.perms = effectivePerms(u); next();
   } catch (e) { next(e); }
@@ -185,7 +196,7 @@ function cleanPerms(req, role, list) {
   return JSON.stringify([...new Set(p)]);
 }
 app.get('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
-  const rows = req.user.role === 'owner' ? await D.all('SELECT * FROM users ORDER BY id') : await D.all("SELECT * FROM users WHERE role='employee' ORDER BY id");
+  const rows = req.user.role === 'owner' ? await D.all('SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id ORDER BY u.id') : await D.all("SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id WHERE u.role='employee' ORDER BY u.id");
   res.json({ users: rows.map(pubUser), defaults: DEF, all: ALL });
 }));
 app.post('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
@@ -194,7 +205,7 @@ app.post('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
   if (!name || !/^[a-z0-9._-]{3,32}$/i.test(username)) bad('Name and username (3-32 letters/numbers/._-) are required');
   if (String(b.password || '').length < 8) bad('Password must be at least 8 characters');
   if (await D.get('SELECT 1 x FROM users WHERE lower(username)=lower(@u)', { u: username })) bad('Username already taken', 409);
-  const u = await D.get('INSERT INTO users(username,name,password_hash,role,permissions,created_by) VALUES(@u,@n,@h,@r,@p,@c) RETURNING *', { u: username, n: name, h: await bcrypt.hash(b.password, 10), r: role, p: cleanPerms(req, role, b.permissions), c: req.user.id });
+  const u = await D.get('INSERT INTO users(username,name,password_hash,role,permissions,created_by,route_id) VALUES(@u,@n,@h,@r,@p,@c,@rt) RETURNING *', { rt: await checkRoute(b.route_id), u: username, n: name, h: await bcrypt.hash(b.password, 10), r: role, p: cleanPerms(req, role, b.permissions), c: req.user.id });
   await A(req, 'user.create', 'user', u.id, `${username} (${role})`); res.json(pubUser(u));
 }));
 app.patch('/api/users/:id', auth, need('users.manage'), wrap(async (req, res) => {
@@ -207,7 +218,7 @@ app.patch('/api/users/:id', auth, need('users.manage'), wrap(async (req, res) =>
   let active = t.active; if (b.active !== undefined) { if (t.id === req.user.id) bad('You cannot deactivate yourself'); active = b.active ? 1 : 0; }
   const perms = b.permissions !== undefined ? cleanPerms(req, role, b.permissions) : (role !== t.role ? null : t.permissions);
   let hash = t.password_hash; if (b.password) { if (String(b.password).length < 8) bad('Password must be at least 8 characters'); hash = await bcrypt.hash(b.password, 10); }
-  const u = await D.get('UPDATE users SET name=@n,role=@r,active=@a,permissions=@p,password_hash=@h WHERE id=@id RETURNING *', { n: name, r: role, a: active, p: perms, h: hash, id: t.id });
+  const u = await D.get('UPDATE users SET name=@n,role=@r,active=@a,permissions=@p,password_hash=@h,route_id=@rt WHERE id=@id RETURNING *', { rt: b.route_id !== undefined ? await checkRoute(b.route_id) : t.route_id, n: name, r: role, a: active, p: perms, h: hash, id: t.id });
   await A(req, active !== t.active ? (active ? 'user.activate' : 'user.deactivate') : 'user.update', 'user', t.id, `${t.username}${b.password ? ' (password reset)' : ''}${role !== t.role ? ` role ${t.role}→${role}` : ''}`);
   res.json(pubUser(u));
 }));
@@ -254,25 +265,58 @@ app.post('/api/products/:id/stock', auth, need('inventory.manage'), wrap(async (
 }));
 app.get('/api/stock/movements', auth, need('inventory.manage'), wrap(async (req, res) => res.json(await D.all('SELECT m.*,p.name product,u.name "user" FROM stock_movements m JOIN products p ON p.id=m.product_id LEFT JOIN users u ON u.id=m.user_id ORDER BY m.id DESC LIMIT 100'))));
 
+// ───────── routes (areas): each customer belongs to a route; an employee can be assigned to one ─────────
+async function checkRoute(v) {
+  if (v === undefined || v === null || v === '') return null; const id = +v;
+  if (!Number.isInteger(id) || !(await D.get('SELECT id FROM routes WHERE id=@id AND active=1', { id }))) bad('Choose a valid route'); return id;
+}
+app.get('/api/routes', auth, wrap(async (req, res) => {
+  if (!req.perms.includes('routes.manage')) return res.json(await D.all('SELECT id,name FROM routes WHERE active=1 ORDER BY name'));
+  res.json(await D.all('SELECT r.id,r.name,r.active,(SELECT COUNT(*)::int FROM customers WHERE route_id=r.id) customers,(SELECT COUNT(*)::int FROM users WHERE route_id=r.id) employees FROM routes r ORDER BY r.name'));
+}));
+app.post('/api/routes', auth, need('routes.manage'), wrap(async (req, res) => {
+  const name = str(req.body?.name, 60); if (!name) bad('Route name is required');
+  if (await D.get('SELECT 1 x FROM routes WHERE lower(name)=lower(@n)', { n: name })) bad('A route with this name already exists', 409);
+  const id = (await D.get('INSERT INTO routes(name) VALUES(@n) RETURNING id', { n: name })).id; await A(req, 'route.create', 'route', id, name); res.json({ id });
+}));
+app.patch('/api/routes/:id', auth, need('routes.manage'), wrap(async (req, res) => {
+  const r = await D.get('SELECT * FROM routes WHERE id=@id', { id: +req.params.id }); if (!r) bad('Route not found', 404);
+  const name = str(req.body?.name ?? r.name, 60); if (!name) bad('Route name is required'); const active = req.body?.active === undefined ? r.active : (req.body.active ? 1 : 0);
+  if (await D.get('SELECT 1 x FROM routes WHERE lower(name)=lower(@n) AND id<>@id', { n: name, id: r.id })) bad('A route with this name already exists', 409);
+  await D.run('UPDATE routes SET name=@n,active=@a WHERE id=@id', { n: name, a: active, id: r.id }); await A(req, 'route.update', 'route', r.id, `${r.name} → ${name}${active ? '' : ' (disabled)'}`); res.json({ ok: true });
+}));
+app.delete('/api/routes/:id', auth, need('routes.manage'), wrap(async (req, res) => {
+  const r = await D.get('SELECT * FROM routes WHERE id=@id', { id: +req.params.id }); if (!r) bad('Route not found', 404);
+  const use = await D.get('SELECT (SELECT COUNT(*)::int FROM customers WHERE route_id=@id) c,(SELECT COUNT(*)::int FROM users WHERE route_id=@id) u', { id: r.id });
+  if (use.c || use.u) bad(`This route still has ${use.c} customer(s) and ${use.u} employee(s). Move or unassign them first (or just disable the route).`, 409);
+  await D.run('DELETE FROM routes WHERE id=@id', { id: r.id }); await A(req, 'route.delete', 'route', r.id, r.name); res.json({ ok: true });
+}));
+app.post('/api/customers/assign-route', auth, need('customers.manage', 'routes.manage'), wrap(async (req, res) => {
+  const ids = [...new Set((req.body?.ids || []).map(Number))].filter(Number.isInteger); if (!ids.length || ids.length > 500) bad('Select between 1 and 500 customers');
+  const route = await checkRoute(req.body?.route_id); const r = await D.run('UPDATE customers SET route_id=@r WHERE id=ANY(@ids)', { r: route, ids });
+  await A(req, 'customer.route', 'route', route, `${r.count} customer(s) → ${route ? (await D.get('SELECT name FROM routes WHERE id=@id', { id: route })).name : 'no route'}`); res.json({ updated: r.count });
+}));
+
 // ───────── customers, creditors, payments ─────────
-const BAL = `(COALESCE((SELECT SUM(total-paid) FROM orders WHERE customer_id=c.id AND status='completed'),0)-COALESCE((SELECT SUM(amount) FROM payments WHERE customer_id=c.id),0))`;
+const BAL = `(COALESCE((SELECT SUM(total-paid) FROM orders WHERE customer_id=c.id AND status='completed'),0)-COALESCE((SELECT SUM(amount) FROM payments WHERE customer_id=c.id),0)-COALESCE((SELECT SUM(total) FROM sales_returns WHERE customer_id=c.id AND status='completed' AND refund_method='credit_note'),0))`;
 const custBalance = async (id, t = D) => r2((await t.get(`SELECT ${BAL} AS b FROM customers c WHERE c.id=@id`, { id }))?.b || 0);
 app.get('/api/customers', auth, need('pos.sell', 'customers.manage', 'creditors.manage'), wrap(async (req, res) => {
-  res.json(await D.all(`SELECT c.id,c.name,c.phone,c.address,c.created_at,ROUND((${BAL})::numeric,2)::float8 AS balance FROM customers c WHERE c.name ILIKE @q OR COALESCE(c.phone,'') ILIKE @q ORDER BY c.name LIMIT 500`, { q: `%${str(req.query.q, 60)}%` }));
+  res.json(await D.all(`SELECT c.id,c.name,c.phone,c.address,c.created_at,c.route_id,r.name AS route_name,ROUND((${BAL})::numeric,2)::float8 AS balance FROM customers c LEFT JOIN routes r ON r.id=c.route_id WHERE (c.name ILIKE @q OR COALESCE(c.phone,'') ILIKE @q) AND (@rt::int IS NULL OR c.route_id=@rt) ORDER BY c.name LIMIT 500`, { q: `%${str(req.query.q, 60)}%`, rt: req.user.route_id || null })); // a routed employee only ever receives the shops on their own route
 }));
 app.post('/api/customers', auth, need('pos.sell', 'customers.manage'), wrap(async (req, res) => {
   const name = str(req.body?.name, 100); if (!name) bad('Customer name is required');
-  const id = (await D.get('INSERT INTO customers(name,phone,address) VALUES(@n,@p,@a) RETURNING id', { n: name, p: str(req.body?.phone, 30), a: str(req.body?.address, 200) })).id; await A(req, 'customer.create', 'customer', id, name); res.json({ id, name });
+  const id = (await D.get('INSERT INTO customers(name,phone,address,route_id) VALUES(@n,@p,@a,@rt) RETURNING id', { rt: req.user.route_id || await checkRoute(req.body?.route_id), n: name, p: str(req.body?.phone, 30), a: str(req.body?.address, 200) })).id; await A(req, 'customer.create', 'customer', id, name); res.json({ id, name });
 }));
 app.patch('/api/customers/:id', auth, need('customers.manage'), wrap(async (req, res) => {
   const c = await D.get('SELECT * FROM customers WHERE id=@id', { id: +req.params.id }); if (!c) bad('Customer not found', 404);
   const name = str(req.body?.name ?? c.name, 100); if (!name) bad('Name required');
-  await D.run('UPDATE customers SET name=@n,phone=@p,address=@a WHERE id=@id', { n: name, p: str(req.body?.phone ?? c.phone, 30), a: str(req.body?.address ?? c.address, 200), id: c.id }); await A(req, 'customer.update', 'customer', c.id, name); res.json({ ok: true });
+  await D.run('UPDATE customers SET name=@n,phone=@p,address=@a,route_id=@rt WHERE id=@id', { rt: req.body?.route_id !== undefined ? await checkRoute(req.body.route_id) : c.route_id, n: name, p: str(req.body?.phone ?? c.phone, 30), a: str(req.body?.address ?? c.address, 200), id: c.id }); await A(req, 'customer.update', 'customer', c.id, name); res.json({ ok: true });
 }));
 app.get('/api/customers/:id/ledger', auth, need('customers.manage', 'creditors.manage'), wrap(async (req, res) => {
   const c = await D.get('SELECT * FROM customers WHERE id=@id', { id: +req.params.id }); if (!c) bad('Customer not found', 404);
   res.json({ customer: c, balance: await custBalance(c.id), orders: await D.all('SELECT id,invoice_no,created_at,total,paid,status,payment_method FROM orders WHERE customer_id=@id ORDER BY id DESC LIMIT 100', { id: c.id }),
-    payments: await D.all('SELECT p.*,u.name "user" FROM payments p JOIN users u ON u.id=p.user_id WHERE customer_id=@id ORDER BY p.id DESC LIMIT 100', { id: c.id }) });
+    payments: await D.all('SELECT p.*,u.name "user" FROM payments p JOIN users u ON u.id=p.user_id WHERE customer_id=@id ORDER BY p.id DESC LIMIT 100', { id: c.id }),
+    returns: await D.all('SELECT id,return_no,created_at,total,refund_method,status FROM sales_returns WHERE customer_id=@id ORDER BY id DESC LIMIT 100', { id: c.id }) });
 }));
 app.get('/api/creditors', auth, need('creditors.manage', 'reports.view'), wrap(async (req, res) => res.json(await D.all(`SELECT * FROM (SELECT c.id,c.name,c.phone,ROUND((${BAL})::numeric,2)::float8 AS balance,(SELECT MAX(created_at) FROM orders WHERE customer_id=c.id) AS last_order FROM customers c) x WHERE balance>0.005 ORDER BY balance DESC`))));
 app.post('/api/payments', auth, need('creditors.manage'), wrap(async (req, res) => {
@@ -304,7 +348,7 @@ app.post('/api/orders', auth, need('pos.sell'), wrap(async (req, res) => {
   try {
     out = await D.tx(async t => {
       const ex = await t.get('SELECT id,invoice_no,total FROM orders WHERE client_ref=@r', { r: ref }); if (ex) return { ...ex, duplicate: true };
-      let cust = null; if (b.customer_id) { cust = await t.get('SELECT * FROM customers WHERE id=@id', { id: +b.customer_id }); if (!cust) bad('Customer not found'); }
+      let cust = null; if (b.customer_id) { cust = await t.get('SELECT * FROM customers WHERE id=@id', { id: +b.customer_id }); if (!cust) bad('Customer not found'); if (req.user.route_id && cust.route_id !== req.user.route_id) bad('This customer is not on your route', 403); }
       if (method === 'credit' && !cust) bad('Select a customer for credit sales');
       const ids = [...new Set(b.items.map(i => +i.product_id))]; if (ids.some(i => !Number.isInteger(i))) bad('Invalid product');
       const prods = new Map((await t.all('SELECT * FROM products WHERE id=ANY(@ids) AND active=1', { ids })).map(p => [p.id, p]));
@@ -319,7 +363,7 @@ app.post('/api/orders', auth, need('pos.sell'), wrap(async (req, res) => {
         sub += sg * gross; disc += sg * da; tax += sg * ta; total += sg * lt; lines.push({ p, qty, ret, dp, da, ta, lt: sg * lt });
       }
       // Automatic bill discount: judged on the bill after product discounts and before tax; the single best matching rule applies (rules never stack).
-      sub = r2(sub); disc = r2(disc); tax = r2(tax); const net = r2(sub - disc); if (net < 0) bad('Returns exceed the sale total');
+      sub = r2(sub); disc = r2(disc); tax = r2(tax); const net = r2(sub - disc); if (net < 0) bad('Returns exceed the sale total. To take goods back from a customer, open Orders → the original invoice → “↩ Return”: that records the return against the invoice and stops you returning more than was sold.');
       const matched = (await t.all('SELECT * FROM discount_rules WHERE active=1 ORDER BY percent DESC, min_amount DESC')).find(r => net >= r.min_amount - 1e-9) || null;
       const waived = !!(b.skip_bill_discount && canDisc && matched), rule = waived ? null : matched;
       const billPct = rule ? rule.percent : 0, billAmt = rule ? r2(net * billPct / 100) : 0;
@@ -348,9 +392,22 @@ app.get('/api/orders', auth, need('orders.view_all', 'orders.view_own'), wrap(as
   if (isDate(req.query.from)) { w.push(`${L}>=@from`); p.from = req.query.from; } if (isDate(req.query.to)) { w.push(`${L}<=@to`); p.to = req.query.to; }
   if (['completed', 'cancelled'].includes(req.query.status)) { w.push('o.status=@st'); p.st = req.query.status; }
   if (req.query.q) { w.push('(o.invoice_no ILIKE @q OR o.customer_name ILIKE @q)'); p.q = `%${str(req.query.q, 40)}%`; }
-  res.json(await D.all(`SELECT o.id,o.invoice_no,o.created_at,o.customer_name,o.total,o.paid,o.discount_total,o.payment_method,o.status,u.name employee FROM orders o JOIN users u ON u.id=o.user_id WHERE ${w.join(' AND ')} ORDER BY o.id DESC LIMIT ${Math.min(+req.query.limit || 200, 500)}`, p));
+  res.json(await D.all(`SELECT o.id,o.invoice_no,o.created_at,o.customer_name,o.total,o.paid,o.discount_total,o.payment_method,o.status,(SELECT COALESCE(SUM(r.total),0) FROM sales_returns r WHERE r.order_id=o.id AND r.status='completed') AS returned,u.name employee FROM orders o JOIN users u ON u.id=o.user_id WHERE ${w.join(' AND ')} ORDER BY o.id DESC LIMIT ${Math.min(+req.query.limit || 200, 500)}`, p));
 }));
-app.get('/api/orders/:id', auth, need('orders.view_all', 'orders.view_own'), wrap(async (req, res) => { const o = await orderFull(+req.params.id); if (!o || !canSee(req, o)) bad('Order not found', 404); res.json(o); }));
+app.post('/api/orders/bulk-delete', auth, need('orders.delete'), wrap(async (req, res) => {
+  const ids = [...new Set((req.body?.ids || []).map(Number))].filter(Number.isInteger); if (!ids.length || ids.length > 200) bad('Select between 1 and 200 orders');
+  const gone = await D.tx(async t => {
+    const rows = await t.all('SELECT id,invoice_no,total,customer_name,status,cancel_reason FROM orders WHERE id=ANY(@ids) FOR UPDATE', { ids });
+    if (rows.length !== ids.length) bad('Some selected orders no longer exist', 404);
+    const live = rows.filter(r => r.status !== 'cancelled'); if (live.length) bad('Only cancelled orders can be deleted permanently. Cancel these first: ' + live.map(r => r.invoice_no).join(', '), 409);
+    await t.run('DELETE FROM sales_return_items WHERE return_id IN (SELECT id FROM sales_returns WHERE order_id=ANY(@ids))', { ids }); await t.run('DELETE FROM sales_returns WHERE order_id=ANY(@ids)', { ids });
+    await t.run('DELETE FROM order_items WHERE order_id=ANY(@ids)', { ids }); await t.run('DELETE FROM order_pdfs WHERE order_id=ANY(@ids)', { ids }); await t.run('DELETE FROM orders WHERE id=ANY(@ids)', { ids });
+    return rows;
+  });
+  for (const r of gone) await A(req, 'order.delete', 'order', r.id, `${r.invoice_no} Rs.${r.total} ${r.customer_name || ''} (was cancelled: ${r.cancel_reason || '-'})`);
+  await emit('order', { event: 'deleted', count: gone.length }, null); res.json({ deleted: gone.length });
+}));
+app.get('/api/orders/:id', auth, need('orders.view_all', 'orders.view_own'), wrap(async (req, res) => { const o = await orderFull(+req.params.id); if (!o || !canSee(req, o)) bad('Order not found', 404); o.returns = await D.all('SELECT id,return_no,created_at,total,refund_method,status FROM sales_returns WHERE order_id=@id ORDER BY id', { id: o.id }); res.json(o); }));
 app.get('/api/orders/:id/pdf', auth, need('orders.view_all', 'orders.view_own'), wrap(async (req, res) => {
   const o = await orderFull(+req.params.id); if (!o || !canSee(req, o)) bad('Order not found', 404);
   const thermal = req.query.format === 'thermal', buf = thermal ? await toBuf(invoicePDF(o, await pdfSettings(), 'thermal')) : await getPdf(o.id);
@@ -360,11 +417,87 @@ app.post('/api/orders/:id/cancel', auth, need('orders.cancel'), wrap(async (req,
   const reason = str(req.body?.reason, 200); if (!reason) bad('A cancellation reason is required');
   const o = await D.get('SELECT * FROM orders WHERE id=@id', { id: +req.params.id }); if (!o) bad('Order not found', 404);
   await D.tx(async t => {
+    await t.get('SELECT id FROM orders WHERE id=@id FOR UPDATE', { id: o.id });
+    if ((await t.get("SELECT COUNT(*)::int n FROM sales_returns WHERE order_id=@id AND status='completed'", { id: o.id })).n) bad('This invoice has returns. Cancel its returns first, then cancel the invoice.', 409);
     const r = await t.run("UPDATE orders SET status='cancelled',cancelled_at=now(),cancelled_by=@u,cancel_reason=@r WHERE id=@id AND status='completed'", { u: req.user.id, r: reason, id: o.id }); if (!r.count) bad('Order already cancelled', 409);
     for (const i of await t.all('SELECT * FROM order_items WHERE order_id=@id', { id: o.id })) await t.run('UPDATE products SET stock=stock+@d WHERE id=@p', { d: i.is_return ? -i.qty : i.qty, p: i.product_id });
   });
   try { await savePdf(o.id, true); } catch (e) { logErr(e, 'pdf'); } // stored PDF is re-issued with a CANCELLED stamp
   await A(req, 'order.cancel', 'order', o.id, `${o.invoice_no}: ${reason}`); await emit('order', { id: o.id, invoice_no: o.invoice_no, event: 'cancelled' }, o.user_id); await emit('product', {}); res.json({ ok: true });
+}));
+
+// ───────── sales returns / credit notes — always recorded against the original invoice ─────────
+const METHOD_LABEL = { credit_note: 'Credit to account', cash: 'Cash', card: 'Card', transfer: 'Bank transfer' };
+const returnedSoFar = async (t, orderId) => new Map((await t.all("SELECT ri.order_item_id id, SUM(ri.qty) qty, SUM(ri.line_total) amt FROM sales_return_items ri JOIN sales_returns r ON r.id=ri.return_id WHERE r.order_id=@o AND r.status='completed' GROUP BY ri.order_item_id", { o: orderId })).map(r => [r.id, r]));
+const afterBill = (o, it) => r2(it.line_total * (1 - (o.bill_discount_pct || 0) / 100)); // what the customer really paid for this line
+app.get('/api/orders/:id/returnable', auth, need('returns.create'), wrap(async (req, res) => {
+  const o = await orderFull(+req.params.id); if (!o || !canSee(req, o)) bad('Order not found', 404); const done = await returnedSoFar(D, o.id);
+  res.json({ id: o.id, invoice_no: o.invoice_no, status: o.status, customer_id: o.customer_id, customer_name: o.customer_name, payment_method: o.payment_method, total: o.total, paid: o.paid,
+    items: o.items.filter(i => !i.is_return).map(i => { const d = done.get(i.id) || { qty: 0 }; return { order_item_id: i.id, name: i.name, sold: i.qty, returned: d.qty, remaining: Math.max(0, Math.round((i.qty - d.qty) * 1000) / 1000), unit_refund: r2(afterBill(o, i) / i.qty) }; }) });
+}));
+app.post('/api/returns', auth, need('returns.create'), wrap(async (req, res) => {
+  const b = req.body || {}, ref = str(b.client_ref, 80); if (!/^[\w-]{8,80}$/.test(ref)) bad('Missing return reference');
+  if (!Array.isArray(b.items) || !b.items.length) bad('Choose at least one item to return');
+  const method = ['credit_note', 'cash', 'card', 'transfer'].includes(b.refund_method) ? b.refund_method : bad('Choose how the customer is refunded'), reason = str(b.reason, 200);
+  const o0 = await D.get('SELECT * FROM orders WHERE id=@id', { id: +b.order_id }); if (!o0 || !canSee(req, o0)) bad('Invoice not found', 404);
+  let out;
+  try {
+    out = await D.tx(async t => {
+      const ex = await t.get('SELECT id,return_no,total FROM sales_returns WHERE client_ref=@r', { r: ref }); if (ex) return { ...ex, duplicate: true };
+      const o = await t.get('SELECT * FROM orders WHERE id=@id FOR UPDATE', { id: o0.id }); // one return at a time per invoice, so two people cannot over-return together
+      if (o.status !== 'completed') bad('Only a completed invoice can have returns', 409);
+      if (method === 'credit_note' && !o.customer_id) bad('A credit to the customer’s account needs a customer on the invoice. For a walk-in sale choose Cash, Card or Transfer.');
+      const items = new Map((await t.all('SELECT * FROM order_items WHERE order_id=@id AND is_return=0', { id: o.id })).map(i => [i.id, i])), done = await returnedSoFar(t, o.id), rows = [], seen = new Set(); let sub = 0, disc = 0, tax = 0, total = 0;
+      for (const r of b.items) {
+        const it = items.get(+r.order_item_id); if (!it || seen.has(it.id)) bad('Invalid item in the return'); seen.add(it.id);
+        const qty = Number(r.qty); if (!Number.isFinite(qty) || qty < 0) bad('Return quantity is invalid'); if (qty === 0) continue;
+        const d = done.get(it.id) || { qty: 0, amt: 0 }, left = Math.round((it.qty - d.qty) * 1000) / 1000;
+        if (qty > left + 1e-9) bad(`Only ${left} of ${it.name} can still be returned (sold ${it.qty}, already returned ${d.qty})`, 409);
+        const after = afterBill(o, it), last = Math.abs(qty - left) < 1e-9, lt = last ? r2(after - d.amt) : r2(after * qty / it.qty); // the final part takes the rounding remainder, so the parts add up to exactly what was paid
+        const gross = r2(it.unit_price * qty), tx = r2(it.tax_amt * (qty / it.qty) * (1 - (o.bill_discount_pct || 0) / 100)), dsc = Math.max(0, r2(gross + tx - lt)), tx2 = r2(lt - gross + dsc);
+        rows.push({ it, qty, gross, dsc, tx: tx2, lt, restock: r.restock === false || r.restock === 0 || r.restock === '0' ? 0 : 1 }); sub += gross; disc += dsc; tax += tx2; total += lt;
+      }
+      if (!rows.length) bad('Enter how many to return');
+      for (const r of rows) if (r.restock) await t.run('UPDATE products SET stock=stock+@q,updated_at=now() WHERE id=@id', { q: r.qty, id: r.it.product_id });
+      const seq = parseInt((await t.get("UPDATE settings SET value=((value::int)+1)::text WHERE key='return_seq' RETURNING value")).value), no = 'RET-' + String(seq).padStart(6, '0');
+      const id = (await t.get('INSERT INTO sales_returns(return_no,client_ref,order_id,customer_id,customer_name,user_id,subtotal,discount_total,tax_total,total,refund_method,reason) VALUES(@no,@ref,@o,@c,@cn,@u,@s,@d,@t,@tt,@m,@rs) RETURNING id',
+        { no, ref, o: o.id, c: o.customer_id, cn: o.customer_name, u: req.user.id, s: r2(sub), d: r2(disc), t: r2(tax), tt: r2(total), m: method, rs: reason })).id;
+      const vals = [], ph = rows.map(r => { vals.push(id, r.it.id, r.it.product_id, r.it.name, r.qty, r.it.unit_price, r.gross, r.dsc, r.tx, r.lt, r.restock); return '(' + Array(11).fill('?').join(',') + ')'; });
+      await t.run(`INSERT INTO sales_return_items(return_id,order_item_id,product_id,name,qty,unit_price,gross,discount_amt,tax_amt,line_total,restock) VALUES ${ph.join(',')}`, vals);
+      return { id, return_no: no, total: r2(total), invoice_no: o.invoice_no };
+    });
+  } catch (e) { if (e.code === '23505' && /client_ref/.test(`${e.constraint} ${e.detail} ${e.message}`)) { const ex = await D.get('SELECT id,return_no,total FROM sales_returns WHERE client_ref=@r', { r: ref }); if (ex) return res.json({ ...ex, duplicate: true }); } throw e; }
+  if (out.duplicate) return res.json(out);
+  await A(req, 'return.create', 'return', out.id, `${out.return_no} Rs.${out.total} against ${out.invoice_no} (${METHOD_LABEL[method]})${reason ? ': ' + reason : ''}`);
+  await emit('order', { id: o0.id, invoice_no: out.invoice_no, event: 'returned', return_no: out.return_no }, o0.user_id); await emit('product', {});
+  res.json({ id: out.id, return_no: out.return_no, total: out.total, invoice_no: out.invoice_no });
+}));
+app.get('/api/returns', auth, need('returns.create', 'orders.view_all'), wrap(async (req, res) => {
+  const all = req.perms.includes('orders.view_all');
+  res.json(await D.all(`SELECT r.id,r.return_no,r.created_at,r.total,r.refund_method,r.status,r.reason,r.customer_name,o.invoice_no,o.id AS order_id,u.name employee FROM sales_returns r JOIN orders o ON o.id=r.order_id JOIN users u ON u.id=r.user_id WHERE ${all ? '1=1' : 'o.user_id=@me'} ORDER BY r.id DESC LIMIT 300`, { me: req.user.id }));
+}));
+async function returnDoc(id) {
+  const r = await D.get('SELECT r.*,u.name employee,o.invoice_no,o.user_id AS order_user,c.phone customer_phone,c.address customer_address FROM sales_returns r JOIN users u ON u.id=r.user_id JOIN orders o ON o.id=r.order_id LEFT JOIN customers c ON c.id=r.customer_id WHERE r.id=@id', { id });
+  if (r) r.items = await D.all('SELECT ri.*,oi.discount_pct FROM sales_return_items ri JOIN order_items oi ON oi.id=ri.order_item_id WHERE ri.return_id=@id ORDER BY ri.id', { id }); return r;
+}
+app.get('/api/returns/:id/pdf', auth, need('returns.create', 'orders.view_all'), wrap(async (req, res) => {
+  const r = await returnDoc(+req.params.id); if (!r || !canSee(req, { user_id: r.order_user })) bad('Return not found', 404);
+  const o = { title: 'CREDIT NOTE', against: r.invoice_no, invoice_no: r.return_no, created_at: r.created_at, employee: r.employee, customer_id: r.customer_id, customer_name: r.customer_name, customer_phone: r.customer_phone, customer_address: r.customer_address,
+    payment_method: r.refund_method, subtotal: r.subtotal, discount_total: r.discount_total, tax_total: r.tax_total, total: r.total, paid: 0, prev_outstanding: 0, status: r.status === 'cancelled' ? 'cancelled' : 'completed', note: r.reason,
+    items: r.items.map(i => ({ name: i.name + (i.restock ? '' : ' (not restocked)'), qty: i.qty, unit_price: i.unit_price, discount_pct: i.discount_pct, discount_amt: i.discount_amt, line_total: i.line_total, is_return: 0 })) };
+  const thermal = req.query.format === 'thermal', buf = await toBuf(invoicePDF(o, await pdfSettings(), thermal ? 'thermal' : 'a4'));
+  res.set({ 'Content-Type': 'application/pdf', 'Content-Length': buf.length, 'Content-Disposition': `${req.query.download ? 'attachment' : 'inline'}; filename="${r.return_no}${thermal ? '-57mm' : ''}.pdf"` }); res.end(buf);
+}));
+app.post('/api/returns/:id/cancel', auth, need('orders.cancel'), wrap(async (req, res) => {
+  const reason = str(req.body?.reason, 200); if (!reason) bad('A reason is required');
+  const r = await D.get('SELECT * FROM sales_returns WHERE id=@id', { id: +req.params.id }); if (!r) bad('Return not found', 404);
+  await D.tx(async t => {
+    const u = await t.run("UPDATE sales_returns SET status='cancelled',cancelled_at=now(),cancelled_by=@u WHERE id=@id AND status='completed'", { u: req.user.id, id: r.id }); if (!u.count) bad('This return is already cancelled', 409);
+    for (const i of await t.all('SELECT * FROM sales_return_items WHERE return_id=@id AND restock=1', { id: r.id })) {
+      const d = await t.run('UPDATE products SET stock=stock-@q WHERE id=@p AND stock>=@q-0.0000001', { q: i.qty, p: i.product_id }); if (!d.count) bad(`Cannot cancel: the ${i.name} that came back has already been sold again`, 409);
+    }
+  });
+  await A(req, 'return.cancel', 'return', r.id, `${r.return_no}: ${reason}`); await emit('order', { id: r.order_id, event: 'returned' }, null); await emit('product', {}); res.json({ ok: true });
 }));
 
 // ───────── automatic bill discount rules ─────────
@@ -389,16 +522,27 @@ app.delete('/api/discount-rules/:id', auth, need('discounts.manage'), wrap(async
 
 // ───────── analytics ─────────
 async function summary(from, to) {
-  const off = await offMin(), t = await today(), P = (a, b) => D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b });
+  const off = await offMin(), t = await today();
+  const R = (a, b) => D.get(`SELECT COALESCE(SUM(total),0) total,COUNT(*)::int n FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b });
+  const P = async (a, b) => { const x = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b }), r = await R(a, b); return { ...x, revenue: r2(x.revenue - r.total), returns: r.total }; };
   const cards = { today: await P(t, t), yesterday: await P(addDays(t, -1), addDays(t, -1)), week: await P(addDays(t, -6), t), month: await P(t.slice(0, 8) + '01', t), year: await P(t.slice(0, 5) + '01-01', t) };
   const base = { off, a: from, b: to };
   const range_stats = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts,COALESCE(SUM(bill_discount_amt),0) bill_discounts,COALESCE(SUM(tax_total),0) tax,COALESCE(SUM(CASE WHEN paid>=total-0.005 THEN 1 ELSE 0 END),0)::int paid_orders,COALESCE(SUM(CASE WHEN paid<total-0.005 THEN 1 ELSE 0 END),0)::int unpaid_orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, base);
-  range_stats.avg_order = range_stats.orders ? r2(range_stats.revenue / range_stats.orders) : 0; range_stats.cancelled = (await D.get(`SELECT COUNT(*)::int n FROM orders o WHERE status='cancelled' AND ${L} BETWEEN @a AND @b`, base)).n;
-  const grp = e => D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) revenue,COUNT(*)::int orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1 ORDER BY 1`, base);
+  const rr = await R(from, to); range_stats.gross_sales = range_stats.revenue; range_stats.returns_total = rr.total; range_stats.returns_count = rr.n; range_stats.revenue = r2(range_stats.revenue - rr.total);
+  range_stats.avg_order = range_stats.orders ? r2(range_stats.gross_sales / range_stats.orders) : 0; range_stats.cancelled = (await D.get(`SELECT COUNT(*)::int n FROM orders o WHERE status='cancelled' AND ${L} BETWEEN @a AND @b`, base)).n;
+  const grp = async e => {
+    const sl = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) revenue,COUNT(*)::int orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1 ORDER BY 1`, base), rt = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) rv FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1`, base);
+    const m = new Map(rt.map(x => [x.label, x.rv])), seen = new Set(sl.map(x => x.label)), out = sl.map(x => ({ ...x, revenue: r2(x.revenue - (m.get(x.label) || 0)) })); for (const x of rt) if (!seen.has(x.label)) out.push({ label: x.label, revenue: -x.rv, orders: 0 });
+    return out.sort((a, b) => a.label < b.label ? -1 : 1);
+  };
   const day = await grp(`to_char(${L},'YYYY-MM-DD')`), map = new Map(day.map(r => [r.label, r])), filled = []; for (let d = from, n = 0; d <= to && n < 400; d = addDays(d, 1), n++) filled.push(map.get(d) || { label: d, revenue: 0, orders: 0 });
   const series = { day: filled, week: await grp(`to_char(${L},'IYYY-"W"IW')`), month: await grp(`to_char(${L},'YYYY-MM')`), year: await grp(`to_char(${L},'YYYY')`) };
   const products = await D.all(`SELECT p.id,p.name,COALESCE(a.qty,0) qty,COALESCE(a.revenue,0) revenue,COALESCE(a.discount,0) discount FROM products p LEFT JOIN (SELECT oi.product_id pid,SUM(CASE WHEN oi.is_return=1 THEN -oi.qty ELSE oi.qty END) qty,SUM(oi.line_total) revenue,SUM(CASE WHEN oi.is_return=1 THEN -oi.discount_amt ELSE oi.discount_amt END) discount FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY oi.product_id) a ON a.pid=p.id WHERE p.active=1 ORDER BY qty DESC,revenue DESC`, base);
   const employees = (await D.all(`SELECT u.id,u.name,u.role,COUNT(o.id)::int orders,COALESCE(SUM(o.total),0) revenue,COALESCE(SUM(o.discount_total),0) discounts FROM users u LEFT JOIN orders o ON o.user_id=u.id AND o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY u.id ORDER BY revenue DESC`, base)).filter(e => e.role !== 'owner' || e.orders);
+  for (const x of await D.all(`SELECT ri.product_id pid,SUM(ri.qty) qty,SUM(ri.line_total) rev FROM sales_return_items ri JOIN sales_returns o ON o.id=ri.return_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY ri.product_id`, base)) { const p = products.find(q => q.id === x.pid); if (p) { p.qty -= x.qty; p.revenue = r2(p.revenue - x.rev); } }
+  products.sort((a, b) => b.qty - a.qty || b.revenue - a.revenue);
+  for (const x of await D.all(`SELECT user_id,SUM(total) v FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY user_id`, base)) { const e = employees.find(q => q.id === x.user_id); if (e) e.revenue = r2(e.revenue - x.v); }
+  employees.sort((a, b) => b.revenue - a.revenue);
   const payments = await D.all(`SELECT payment_method method,COUNT(*)::int orders,COALESCE(SUM(total),0) revenue FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY payment_method ORDER BY revenue DESC`, base);
   const outstanding = r2((await D.get(`SELECT COALESCE(SUM(b),0) v FROM (SELECT ${BAL} AS b FROM customers c) x WHERE b>0.005`)).v);
   return { today: t, range: { from, to }, cards, range_stats, series, products, employees, payments, outstanding };
@@ -410,7 +554,7 @@ app.get('/api/reports/export', auth, need('reports.export'), wrap(async (req, re
   if (req.query.type === 'pdf') { const buf = await toBuf(reportPDF(d, S)); res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="report-${from}_${to}.pdf"` }); return res.end(buf); }
   const wb = new ExcelJS.Workbook(); wb.creator = S.business_name; const hd = ws => { ws.getRow(1).font = { bold: true }; ws.views = [{ state: 'frozen', ySplit: 1 }]; };
   let ws = wb.addWorksheet('Summary'); ws.columns = [{ header: 'Metric', width: 34 }, { header: 'Value', width: 20 }]; hd(ws); const r = d.range_stats;
-  [['From', from], ['To', to], ['Total revenue', r.revenue], ['Orders', r.orders], ['Average order value', r.avg_order], ['Total discounts', r.discounts], ['  of which automatic bill discounts', r.bill_discounts], ['Tax collected', r.tax], ['Paid orders', r.paid_orders], ['Unpaid/partial orders', r.unpaid_orders], ['Cancelled orders', r.cancelled], ['Outstanding creditor balance', d.outstanding]].forEach(x => ws.addRow(x));
+  [['From', from], ['To', to], ['Total revenue (net of returns)', r.revenue], ['Returns / credit notes', r.returns_total], ['Orders', r.orders], ['Average order value', r.avg_order], ['Total discounts', r.discounts], ['  of which automatic bill discounts', r.bill_discounts], ['Tax collected', r.tax], ['Paid orders', r.paid_orders], ['Unpaid/partial orders', r.unpaid_orders], ['Cancelled orders', r.cancelled], ['Outstanding creditor balance', d.outstanding]].forEach(x => ws.addRow(x));
   ws = wb.addWorksheet('Daily'); ws.columns = [{ header: 'Date', width: 14 }, { header: 'Orders', width: 10 }, { header: 'Revenue', width: 16 }]; hd(ws); d.series.day.forEach(s => ws.addRow([s.label, s.orders, s.revenue]));
   ws = wb.addWorksheet('Products'); ws.columns = [{ header: 'Product', width: 34 }, { header: 'Qty sold', width: 12 }, { header: 'Revenue', width: 16 }, { header: 'Discount', width: 14 }]; hd(ws); d.products.forEach(p => ws.addRow([p.name, p.qty, p.revenue, p.discount]));
   ws = wb.addWorksheet('Employees'); ws.columns = [{ header: 'Name', width: 26 }, { header: 'Role', width: 12 }, { header: 'Orders', width: 10 }, { header: 'Revenue', width: 16 }, { header: 'Discounts', width: 14 }]; hd(ws); d.employees.forEach(e => ws.addRow([e.name, e.role, e.orders, e.revenue, e.discounts]));

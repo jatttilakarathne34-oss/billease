@@ -29,17 +29,19 @@ function a4(o, S) {
   let tx = L; if (lg) { try { doc.image(lg, L, 34, { fit: [46, 46] }); tx = L + 54; } catch {} }
   font(1, 13); one(S.business_name || 'Business', tx, 38, 235);
   font(0, 7, GRAY); let ay = 56; for (const ln of [...lines(S.business_address, 3), S.business_phone, S.business_email].filter(Boolean)) ay = wrapped(ln, tx, ay, 235, 18) + 1;
-  font(1, 15); one('INVOICE', 313, 38, 240);
+  font(1, 15); one(o.title || 'INVOICE', 313, 38, 240);
 
   // recipient (left) + grey info box (right)
   font(1, 9); one('Recipient:', L, 128, 240); font(0, 9.5); one(walkin ? 'Walk-in Customer' : o.customer_name, L, 142, 240);
   let ry = 156; font(0, 9); if (o.customer_phone) { one(o.customer_phone, L, ry, 240); ry += 12; } if (o.customer_address) doc.text(o.customer_address, L, ry, { width: 240 });
-  const rows = [['Invoice date', `${t.date}  ${t.time}`], ['Invoice number', o.invoice_no], ['Customer number', o.customer_id ? String(o.customer_id).padStart(4, '0') : '-'], ['Served by', o.employee], ['Payment method', o.payment_method[0].toUpperCase() + o.payment_method.slice(1)]];
+  const cn = !!o.title, METH = { credit_note: 'Credit to account', cash: 'Cash', card: 'Card', transfer: 'Bank transfer' }, cap = s => METH[s] || (s[0].toUpperCase() + s.slice(1)), cust = o.customer_id ? String(o.customer_id).padStart(4, '0') : '-';
+  const rows = cn ? [['Date', `${t.date}  ${t.time}`], ['Credit note number', o.invoice_no], ['Against invoice', o.against], ['Customer number', cust], ['Processed by', o.employee], ['Refund method', cap(o.payment_method)]]
+    : [['Invoice date', `${t.date}  ${t.time}`], ['Invoice number', o.invoice_no], ['Customer number', cust], ['Served by', o.employee], ['Payment method', cap(o.payment_method)]];
   const bx = 311, bw = R - bx, by = 118; doc.rect(bx, by, bw, rows.length * 13 + 12).fill('#efefef');
   rows.forEach(([k, v], i) => { font(0, 9); one(k, bx, by + 8 + i * 13, 122, 'right'); font(i === 1 ? 1 : 0, 9); one(v, bx + 130, by + 8 + i * 13, bw - 134); });
 
   // greeting
-  font(0, 9.5); one(`Dear ${walkin ? 'Customer' : o.customer_name},`, L, 216, W); one('Thank you for your order. We hereby invoice you for the following products:', L, 238, W);
+  font(0, 9.5); one(`Dear ${walkin ? 'Customer' : o.customer_name},`, L, 216, W); one(cn ? 'We hereby credit you for the following returned products:' : 'Thank you for your order. We hereby invoice you for the following products:', L, 238, W);
 
   // items table: grey header, ruled columns, tall frame
   const X = [L, 255, 310, 390, 465, R], TOP = 268, ROW = 15, MINB = 560, MAXB = 700;
@@ -73,8 +75,8 @@ function a4(o, S) {
   if (o.discount_total > 0.005) { tr('Subtotal', m(o.subtotal)); if (prodDisc > 0.005) tr('Discount', '- ' + m(prodDisc)); if (bill > 0.005) tr(`Bill discount (${q(o.bill_discount_pct)}%)`, '- ' + m(bill), 0, 9.5, '#166534'); }
   tr('Net amount', m(net), 1); tr('Sales tax', m(o.tax_total), 1);
   doc.lineWidth(0.8).strokeColor('#000000').moveTo(330, y).lineTo(R, y).stroke().moveTo(330, y + 2).lineTo(R, y + 2).stroke(); y += 9;
-  tr('Invoice total (Rs.)', m(o.total), 1, 11.5); y += 2;
-  tr('Paid', m(o.paid)); if (o.total - o.paid > 0.005) tr('Balance due', m(o.total - o.paid), 1, 9.5, '#b91c1c'); if (o.prev_outstanding > 0.005) tr('Previous outstanding', m(o.prev_outstanding));
+  tr(cn ? 'Credit total (Rs.)' : 'Invoice total (Rs.)', m(o.total), 1, 11.5); y += 2;
+  if (!cn) tr('Paid', m(o.paid)); if (!cn && o.total - o.paid > 0.005) tr('Balance due', m(o.total - o.paid), 1, 9.5, '#b91c1c'); if (!cn && o.prev_outstanding > 0.005) tr('Previous outstanding', m(o.prev_outstanding));
 
   // closing
   y = Math.max(y + 22, 700); if (y + 36 > 764) { footer(); doc.addPage(); y = 60; }
@@ -97,8 +99,8 @@ function thermalDraw(doc, o, S) {
   if (S.business_address) txt(S.business_address, { sz: 9, al: 'center' });
   if (S.business_phone) txt(S.business_phone, { sz: 9, al: 'center' });
   line();
-  txt('SALES INVOICE', { b: 1, sz: 11, al: 'center' }); doc.y += 3;
-  txt(`INV REF No : ${o.invoice_no}`); txt(`${t.date} ${t.time}`);
+  const cn = !!o.title; txt(o.title || 'SALES INVOICE', { b: 1, sz: 11, al: 'center' }); doc.y += 3;
+  txt(`${cn ? 'CN No' : 'INV REF No'} : ${o.invoice_no}`); if (cn && o.against) txt(`Invoice : ${o.against}`); txt(`${t.date} ${t.time}`);
   txt(`Rep      : ${o.employee}`); if (S.route_name) txt(`Route   : ${S.route_name}`);
   txt(`Customer : ${(o.customer_name || 'Walk-in').toUpperCase()}`);
   line();
@@ -112,9 +114,10 @@ function thermalDraw(doc, o, S) {
   const bill = o.bill_discount_amt || 0; pair('Gross Amount :', m(o.subtotal)); pair('Discount :', m(o.discount_total - bill)); if (bill > 0.005) pair(`Bill disc ${q(o.bill_discount_pct)}% :`, m(bill));
   if (o.tax_total) pair('Tax :', m(o.tax_total));
   line();
-  pair('Net Amount :', m(o.total), true, 11); pair('Outstanding :', m(o.prev_outstanding));
+  if (cn) { pair('Credit Total :', m(o.total), true, 11); pair('Refund :', ({ credit_note: 'TO ACCOUNT', cash: 'CASH', card: 'CARD', transfer: 'TRANSFER' })[o.payment_method] || o.payment_method.toUpperCase()); }
+  else { pair('Net Amount :', m(o.total), true, 11); pair('Outstanding :', m(o.prev_outstanding));
   pair('Net Payable :', m(o.total + o.prev_outstanding), true, 11); pair('Paid Amount :', m(o.paid));
-  pair('Payment :', o.payment_method.toUpperCase());
+  pair('Payment :', o.payment_method.toUpperCase()); }
   line();
   if (o.status === 'cancelled') txt('*** CANCELLED ***', { b: 1, sz: 12, al: 'center' });
   txt(S.receipt_footer || 'Thank you!', { sz: 9, al: 'center' }); txt('powered by BillEase', { sz: 7.5, al: 'center' });
@@ -135,7 +138,7 @@ function reportPDF(d, S) {
   doc.font('Helvetica').fontSize(11).fillColor('#555').text(`Sales Report: ${d.range.from} to ${d.range.to}`).moveDown(1);
   const kv = (k, v) => { const y = doc.y; doc.fillColor('#111').font('Helvetica').fontSize(10.5).text(k, 40, y, { width: 250 }).font('Helvetica-Bold').text(v, 300, y, { width: 255, align: 'right' }); doc.moveDown(0.3); };
   const r = d.range_stats;
-  kv('Total revenue', 'Rs. ' + m(r.revenue)); kv('Orders', String(r.orders)); kv('Average order value', 'Rs. ' + m(r.avg_order));
+  kv('Total revenue (net of returns)', 'Rs. ' + m(r.revenue)); kv('Returns / credit notes', 'Rs. ' + m(r.returns_total || 0)); kv('Orders', String(r.orders)); kv('Average order value', 'Rs. ' + m(r.avg_order));
   kv('Total discounts', 'Rs. ' + m(r.discounts)); kv('  of which automatic bill discounts', 'Rs. ' + m(r.bill_discounts || 0)); kv('Tax collected', 'Rs. ' + m(r.tax));
   kv('Paid orders / Unpaid-partial orders', `${r.paid_orders} / ${r.unpaid_orders}`); kv('Outstanding creditor balance', 'Rs. ' + m(d.outstanding));
   const table = (title, cols, rows) => {
