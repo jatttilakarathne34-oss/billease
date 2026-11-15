@@ -137,7 +137,8 @@ async function auth(req, res, next) {
     let p; try { p = jwt.verify(t, SECRET); } catch { return res.status(401).json({ error: 'Session expired' }); }
     const u = await D.get('SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id WHERE u.id=@id', { id: p.id });
     if (!u || !u.active) return res.status(401).json({ error: 'Account disabled' });
-    req.user = u; req.perms = effectivePerms(u); next();
+    req.user = u; req.perms = effectivePerms(u);
+    req.team = u.role === 'owner' ? null : u.role === 'manager' ? [u.id, ...(await D.all('SELECT id FROM users WHERE created_by=@id', { id: u.id })).map(r => r.id)] : [u.id]; next();
   } catch (e) { next(e); }
 }
 const need = (...ps) => (req, res, next) => ps.some(p => req.perms.includes(p)) ? next() : res.status(403).json({ error: 'You do not have permission for this action' });
@@ -196,7 +197,7 @@ function cleanPerms(req, role, list) {
   return JSON.stringify([...new Set(p)]);
 }
 app.get('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
-  const rows = req.user.role === 'owner' ? await D.all('SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id ORDER BY u.id') : await D.all("SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id WHERE u.role='employee' ORDER BY u.id");
+  const rows = req.user.role === 'owner' ? await D.all('SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id ORDER BY u.id') : await D.all("SELECT u.*, r.name AS route_name FROM users u LEFT JOIN routes r ON r.id=u.route_id WHERE u.role='employee' AND u.created_by=@me ORDER BY u.id", { me: req.user.id });
   res.json({ users: rows.map(pubUser), defaults: DEF, all: ALL });
 }));
 app.post('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
@@ -211,7 +212,7 @@ app.post('/api/users', auth, need('users.manage'), wrap(async (req, res) => {
 app.patch('/api/users/:id', auth, need('users.manage'), wrap(async (req, res) => {
   const t = await D.get('SELECT * FROM users WHERE id=@id', { id: +req.params.id }); if (!t) bad('User not found', 404);
   if (t.role === 'owner') bad('The owner account cannot be modified here', 403);
-  if (req.user.role !== 'owner' && t.role !== 'employee') bad('Managers can only manage employees', 403);
+  if (req.user.role !== 'owner' && (t.role !== 'employee' || t.created_by !== req.user.id)) bad('Managers can only manage the employees they added', 403);
   const b = req.body || {}; let role = t.role;
   if (b.role !== undefined && b.role !== t.role) { if (req.user.role !== 'owner') bad('Only the owner can change roles', 403); if (!['manager', 'employee'].includes(b.role)) bad('Invalid role'); role = b.role; }
   const name = b.name !== undefined ? str(b.name, 80) : t.name; if (!name) bad('Name required');
@@ -332,7 +333,7 @@ async function orderFull(id) {
   const o = await D.get('SELECT o.*,u.name employee,c.phone customer_phone,c.address customer_address FROM orders o JOIN users u ON u.id=o.user_id LEFT JOIN customers c ON c.id=o.customer_id WHERE o.id=@id', { id });
   if (o) o.items = await D.all('SELECT * FROM order_items WHERE order_id=@id ORDER BY id', { id }); return o;
 }
-const canSee = (req, o) => req.perms.includes('orders.view_all') || (req.perms.includes('orders.view_own') && o.user_id === req.user.id);
+const canSee = (req, o) => (req.perms.includes('orders.view_all') && (!req.team || req.team.includes(o.user_id))) || (req.perms.includes('orders.view_own') && o.user_id === req.user.id);
 async function savePdf(id, replace) {
   const o = await orderFull(id), buf = await toBuf(invoicePDF(o, await pdfSettings(), 'a4'));
   await D.run(`INSERT INTO order_pdfs(order_id,invoice_no,pdf,size) VALUES(@i,@n,@p,@s) ON CONFLICT(order_id) DO ${replace ? 'UPDATE SET pdf=excluded.pdf,size=excluded.size,updated_at=now()' : 'NOTHING'}`, { i: id, n: o.invoice_no, p: buf, s: buf.length });
@@ -388,7 +389,7 @@ app.post('/api/orders', auth, need('pos.sell'), wrap(async (req, res) => {
 }));
 app.get('/api/orders', auth, need('orders.view_all', 'orders.view_own'), wrap(async (req, res) => {
   const w = ['1=1'], p = { off: await offMin() }, all = req.perms.includes('orders.view_all');
-  if (!all) { w.push('o.user_id=@me'); p.me = req.user.id; } else if (+req.query.user) { w.push('o.user_id=@u'); p.u = +req.query.user; }
+  if (!all) { w.push('o.user_id=@me'); p.me = req.user.id; } else { if (req.team) { w.push('o.user_id=ANY(@team)'); p.team = req.team; } if (+req.query.user) { w.push('o.user_id=@u'); p.u = +req.query.user; } }
   if (isDate(req.query.from)) { w.push(`${L}>=@from`); p.from = req.query.from; } if (isDate(req.query.to)) { w.push(`${L}<=@to`); p.to = req.query.to; }
   if (['completed', 'cancelled'].includes(req.query.status)) { w.push('o.status=@st'); p.st = req.query.status; }
   if (req.query.q) { w.push('(o.invoice_no ILIKE @q OR o.customer_name ILIKE @q)'); p.q = `%${str(req.query.q, 40)}%`; }
@@ -415,7 +416,7 @@ app.get('/api/orders/:id/pdf', auth, need('orders.view_all', 'orders.view_own'),
 }));
 app.post('/api/orders/:id/cancel', auth, need('orders.cancel'), wrap(async (req, res) => {
   const reason = str(req.body?.reason, 200); if (!reason) bad('A cancellation reason is required');
-  const o = await D.get('SELECT * FROM orders WHERE id=@id', { id: +req.params.id }); if (!o) bad('Order not found', 404);
+  const o = await D.get('SELECT * FROM orders WHERE id=@id', { id: +req.params.id }); if (!o || !canSee(req, o)) bad('Order not found', 404);
   await D.tx(async t => {
     await t.get('SELECT id FROM orders WHERE id=@id FOR UPDATE', { id: o.id });
     if ((await t.get("SELECT COUNT(*)::int n FROM sales_returns WHERE order_id=@id AND status='completed'", { id: o.id })).n) bad('This invoice has returns. Cancel its returns first, then cancel the invoice.', 409);
@@ -474,7 +475,7 @@ app.post('/api/returns', auth, need('returns.create'), wrap(async (req, res) => 
 }));
 app.get('/api/returns', auth, need('returns.create', 'orders.view_all'), wrap(async (req, res) => {
   const all = req.perms.includes('orders.view_all');
-  res.json(await D.all(`SELECT r.id,r.return_no,r.created_at,r.total,r.refund_method,r.status,r.reason,r.customer_name,o.invoice_no,o.id AS order_id,u.name employee FROM sales_returns r JOIN orders o ON o.id=r.order_id JOIN users u ON u.id=r.user_id WHERE ${all ? '1=1' : 'o.user_id=@me'} ORDER BY r.id DESC LIMIT 300`, { me: req.user.id }));
+  res.json(await D.all(`SELECT r.id,r.return_no,r.created_at,r.total,r.refund_method,r.status,r.reason,r.customer_name,o.invoice_no,o.id AS order_id,u.name employee FROM sales_returns r JOIN orders o ON o.id=r.order_id JOIN users u ON u.id=r.user_id WHERE ${all ? (req.team ? 'o.user_id=ANY(@team)' : '1=1') : 'o.user_id=@me'} ORDER BY r.id DESC LIMIT 300`, { me: req.user.id, team: req.team }));
 }));
 async function returnDoc(id) {
   const r = await D.get('SELECT r.*,u.name employee,o.invoice_no,o.user_id AS order_user,c.phone customer_phone,c.address customer_address FROM sales_returns r JOIN users u ON u.id=r.user_id JOIN orders o ON o.id=r.order_id LEFT JOIN customers c ON c.id=r.customer_id WHERE r.id=@id', { id });
@@ -490,7 +491,7 @@ app.get('/api/returns/:id/pdf', auth, need('returns.create', 'orders.view_all'),
 }));
 app.post('/api/returns/:id/cancel', auth, need('orders.cancel'), wrap(async (req, res) => {
   const reason = str(req.body?.reason, 200); if (!reason) bad('A reason is required');
-  const r = await D.get('SELECT * FROM sales_returns WHERE id=@id', { id: +req.params.id }); if (!r) bad('Return not found', 404);
+  const r = await D.get('SELECT * FROM sales_returns WHERE id=@id', { id: +req.params.id }); if (!r || !canSee(req, await D.get('SELECT user_id FROM orders WHERE id=@id', { id: r.order_id }))) bad('Return not found', 404);
   await D.tx(async t => {
     const u = await t.run("UPDATE sales_returns SET status='cancelled',cancelled_at=now(),cancelled_by=@u WHERE id=@id AND status='completed'", { u: req.user.id, id: r.id }); if (!u.count) bad('This return is already cancelled', 409);
     for (const i of await t.all('SELECT * FROM sales_return_items WHERE return_id=@id AND restock=1', { id: r.id })) {
@@ -521,36 +522,36 @@ app.delete('/api/discount-rules/:id', auth, need('discounts.manage'), wrap(async
 }));
 
 // ───────── analytics ─────────
-async function summary(from, to) {
-  const off = await offMin(), t = await today();
-  const R = (a, b) => D.get(`SELECT COALESCE(SUM(total),0) total,COUNT(*)::int n FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b });
-  const P = async (a, b) => { const x = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, { off, a, b }), r = await R(a, b); return { ...x, revenue: r2(x.revenue - r.total), returns: r.total }; };
+async function summary(from, to, team = null) {
+  const off = await offMin(), t = await today(), tp = team ? { team } : {}, TF = team ? ' AND o.user_id=ANY(@team)' : '', RF = team ? ' AND o.order_id IN (SELECT id FROM orders WHERE user_id=ANY(@team))' : '';
+  const R = (a, b) => D.get(`SELECT COALESCE(SUM(total),0) total,COUNT(*)::int n FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b${RF}`, { off, a, b, ...tp });
+  const P = async (a, b) => { const x = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b${TF}`, { off, a, b, ...tp }), r = await R(a, b); return { ...x, revenue: r2(x.revenue - r.total), returns: r.total }; };
   const cards = { today: await P(t, t), yesterday: await P(addDays(t, -1), addDays(t, -1)), week: await P(addDays(t, -6), t), month: await P(t.slice(0, 8) + '01', t), year: await P(t.slice(0, 5) + '01-01', t) };
-  const base = { off, a: from, b: to };
-  const range_stats = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts,COALESCE(SUM(bill_discount_amt),0) bill_discounts,COALESCE(SUM(tax_total),0) tax,COALESCE(SUM(CASE WHEN paid>=total-0.005 THEN 1 ELSE 0 END),0)::int paid_orders,COALESCE(SUM(CASE WHEN paid<total-0.005 THEN 1 ELSE 0 END),0)::int unpaid_orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b`, base);
+  const base = { off, a: from, b: to, ...tp };
+  const range_stats = await D.get(`SELECT COALESCE(SUM(total),0) revenue,COUNT(*)::int orders,COALESCE(SUM(discount_total),0) discounts,COALESCE(SUM(bill_discount_amt),0) bill_discounts,COALESCE(SUM(tax_total),0) tax,COALESCE(SUM(CASE WHEN paid>=total-0.005 THEN 1 ELSE 0 END),0)::int paid_orders,COALESCE(SUM(CASE WHEN paid<total-0.005 THEN 1 ELSE 0 END),0)::int unpaid_orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b${TF}`, base);
   const rr = await R(from, to); range_stats.gross_sales = range_stats.revenue; range_stats.returns_total = rr.total; range_stats.returns_count = rr.n; range_stats.revenue = r2(range_stats.revenue - rr.total);
-  range_stats.avg_order = range_stats.orders ? r2(range_stats.gross_sales / range_stats.orders) : 0; range_stats.cancelled = (await D.get(`SELECT COUNT(*)::int n FROM orders o WHERE status='cancelled' AND ${L} BETWEEN @a AND @b`, base)).n;
+  range_stats.avg_order = range_stats.orders ? r2(range_stats.gross_sales / range_stats.orders) : 0; range_stats.cancelled = (await D.get(`SELECT COUNT(*)::int n FROM orders o WHERE status='cancelled' AND ${L} BETWEEN @a AND @b${TF}`, base)).n;
   const grp = async e => {
-    const sl = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) revenue,COUNT(*)::int orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1 ORDER BY 1`, base), rt = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) rv FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY 1`, base);
+    const sl = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) revenue,COUNT(*)::int orders FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b${TF} GROUP BY 1 ORDER BY 1`, base), rt = await D.all(`SELECT ${e} AS label,COALESCE(SUM(total),0) rv FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b${RF} GROUP BY 1`, base);
     const m = new Map(rt.map(x => [x.label, x.rv])), seen = new Set(sl.map(x => x.label)), out = sl.map(x => ({ ...x, revenue: r2(x.revenue - (m.get(x.label) || 0)) })); for (const x of rt) if (!seen.has(x.label)) out.push({ label: x.label, revenue: -x.rv, orders: 0 });
     return out.sort((a, b) => a.label < b.label ? -1 : 1);
   };
   const day = await grp(`to_char(${L},'YYYY-MM-DD')`), map = new Map(day.map(r => [r.label, r])), filled = []; for (let d = from, n = 0; d <= to && n < 400; d = addDays(d, 1), n++) filled.push(map.get(d) || { label: d, revenue: 0, orders: 0 });
   const series = { day: filled, week: await grp(`to_char(${L},'IYYY-"W"IW')`), month: await grp(`to_char(${L},'YYYY-MM')`), year: await grp(`to_char(${L},'YYYY')`) };
-  const products = await D.all(`SELECT p.id,p.name,COALESCE(a.qty,0) qty,COALESCE(a.revenue,0) revenue,COALESCE(a.discount,0) discount FROM products p LEFT JOIN (SELECT oi.product_id pid,SUM(CASE WHEN oi.is_return=1 THEN -oi.qty ELSE oi.qty END) qty,SUM(oi.line_total) revenue,SUM(CASE WHEN oi.is_return=1 THEN -oi.discount_amt ELSE oi.discount_amt END) discount FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY oi.product_id) a ON a.pid=p.id WHERE p.active=1 ORDER BY qty DESC,revenue DESC`, base);
-  const employees = (await D.all(`SELECT u.id,u.name,u.role,COUNT(o.id)::int orders,COALESCE(SUM(o.total),0) revenue,COALESCE(SUM(o.discount_total),0) discounts FROM users u LEFT JOIN orders o ON o.user_id=u.id AND o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY u.id ORDER BY revenue DESC`, base)).filter(e => e.role !== 'owner' || e.orders);
-  for (const x of await D.all(`SELECT ri.product_id pid,SUM(ri.qty) qty,SUM(ri.line_total) rev FROM sales_return_items ri JOIN sales_returns o ON o.id=ri.return_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b GROUP BY ri.product_id`, base)) { const p = products.find(q => q.id === x.pid); if (p) { p.qty -= x.qty; p.revenue = r2(p.revenue - x.rev); } }
+  const products = await D.all(`SELECT p.id,p.name,COALESCE(a.qty,0) qty,COALESCE(a.revenue,0) revenue,COALESCE(a.discount,0) discount FROM products p LEFT JOIN (SELECT oi.product_id pid,SUM(CASE WHEN oi.is_return=1 THEN -oi.qty ELSE oi.qty END) qty,SUM(oi.line_total) revenue,SUM(CASE WHEN oi.is_return=1 THEN -oi.discount_amt ELSE oi.discount_amt END) discount FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b${TF} GROUP BY oi.product_id) a ON a.pid=p.id WHERE p.active=1 ORDER BY qty DESC,revenue DESC`, base);
+  const employees = (await D.all(`SELECT u.id,u.name,u.role,COUNT(o.id)::int orders,COALESCE(SUM(o.total),0) revenue,COALESCE(SUM(o.discount_total),0) discounts FROM users u LEFT JOIN orders o ON o.user_id=u.id AND o.status='completed' AND ${L} BETWEEN @a AND @b${TF} GROUP BY u.id ORDER BY revenue DESC`, base)).filter(e => (e.role !== 'owner' || e.orders) && (!team || team.includes(e.id)));
+  for (const x of await D.all(`SELECT ri.product_id pid,SUM(ri.qty) qty,SUM(ri.line_total) rev FROM sales_return_items ri JOIN sales_returns o ON o.id=ri.return_id WHERE o.status='completed' AND ${L} BETWEEN @a AND @b${RF} GROUP BY ri.product_id`, base)) { const p = products.find(q => q.id === x.pid); if (p) { p.qty -= x.qty; p.revenue = r2(p.revenue - x.rev); } }
   products.sort((a, b) => b.qty - a.qty || b.revenue - a.revenue);
-  for (const x of await D.all(`SELECT user_id,SUM(total) v FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY user_id`, base)) { const e = employees.find(q => q.id === x.user_id); if (e) e.revenue = r2(e.revenue - x.v); }
+  for (const x of await D.all(`SELECT user_id,SUM(total) v FROM sales_returns o WHERE status='completed' AND ${L} BETWEEN @a AND @b${RF} GROUP BY user_id`, base)) { const e = employees.find(q => q.id === x.user_id); if (e) e.revenue = r2(e.revenue - x.v); }
   employees.sort((a, b) => b.revenue - a.revenue);
-  const payments = await D.all(`SELECT payment_method method,COUNT(*)::int orders,COALESCE(SUM(total),0) revenue FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b GROUP BY payment_method ORDER BY revenue DESC`, base);
-  const outstanding = r2((await D.get(`SELECT COALESCE(SUM(b),0) v FROM (SELECT ${BAL} AS b FROM customers c) x WHERE b>0.005`)).v);
-  return { today: t, range: { from, to }, cards, range_stats, series, products, employees, payments, outstanding };
+  const payments = await D.all(`SELECT payment_method method,COUNT(*)::int orders,COALESCE(SUM(total),0) revenue FROM orders o WHERE status='completed' AND ${L} BETWEEN @a AND @b${TF} GROUP BY payment_method ORDER BY revenue DESC`, base);
+  const outstanding = r2((await D.get(`SELECT COALESCE(SUM(b),0) v FROM (SELECT ${BAL} AS b FROM customers c ${team ? 'WHERE c.id IN (SELECT customer_id FROM orders WHERE user_id=ANY(@team))' : ''}) x WHERE b>0.005`, tp)).v);
+  return { scope: team ? 'team' : 'all', today: t, range: { from, to }, cards, range_stats, series, products, employees, payments, outstanding };
 }
 async function rangeOf(q) { const t = await today(); let to = isDate(q.to) ? q.to : t, from = isDate(q.from) ? q.from : addDays(to, -29); if (from > to) [from, to] = [to, from]; if (new Date(to) - new Date(from) > 3660 * 864e5) bad('Range too large'); return [from, to]; }
-app.get('/api/reports/summary', auth, need('reports.view'), wrap(async (req, res) => res.json(await summary(...(await rangeOf(req.query))))));
+app.get('/api/reports/summary', auth, need('reports.view'), wrap(async (req, res) => res.json(await summary(...(await rangeOf(req.query)), req.team))));
 app.get('/api/reports/export', auth, need('reports.export'), wrap(async (req, res) => {
-  const [from, to] = await rangeOf(req.query), d = await summary(from, to), S = await pdfSettings(); await A(req, 'report.export', 'report', null, `${req.query.type || 'xlsx'} ${from}..${to}`);
+  const [from, to] = await rangeOf(req.query), d = await summary(from, to, req.team), S = await pdfSettings(); await A(req, 'report.export', 'report', null, `${req.query.type || 'xlsx'} ${from}..${to}`);
   if (req.query.type === 'pdf') { const buf = await toBuf(reportPDF(d, S)); res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="report-${from}_${to}.pdf"` }); return res.end(buf); }
   const wb = new ExcelJS.Workbook(); wb.creator = S.business_name; const hd = ws => { ws.getRow(1).font = { bold: true }; ws.views = [{ state: 'frozen', ySplit: 1 }]; };
   let ws = wb.addWorksheet('Summary'); ws.columns = [{ header: 'Metric', width: 34 }, { header: 'Value', width: 20 }]; hd(ws); const r = d.range_stats;
@@ -559,7 +560,7 @@ app.get('/api/reports/export', auth, need('reports.export'), wrap(async (req, re
   ws = wb.addWorksheet('Products'); ws.columns = [{ header: 'Product', width: 34 }, { header: 'Qty sold', width: 12 }, { header: 'Revenue', width: 16 }, { header: 'Discount', width: 14 }]; hd(ws); d.products.forEach(p => ws.addRow([p.name, p.qty, p.revenue, p.discount]));
   ws = wb.addWorksheet('Employees'); ws.columns = [{ header: 'Name', width: 26 }, { header: 'Role', width: 12 }, { header: 'Orders', width: 10 }, { header: 'Revenue', width: 16 }, { header: 'Discounts', width: 14 }]; hd(ws); d.employees.forEach(e => ws.addRow([e.name, e.role, e.orders, e.revenue, e.discounts]));
   ws = wb.addWorksheet('Orders'); ws.columns = ['Invoice', 'Date', 'Employee', 'Customer', 'Method', 'Subtotal', 'Discount', 'Tax', 'Total', 'Paid', 'Status'].map(h => ({ header: h, width: 16 })); hd(ws);
-  (await D.all(`SELECT o.*,u.name employee,to_char((o.created_at AT TIME ZONE 'UTC') + (@off::int * interval '1 minute'),'YYYY-MM-DD HH24:MI:SS') AS local FROM orders o JOIN users u ON u.id=o.user_id WHERE ${L} BETWEEN @a AND @b ORDER BY o.id`, { off: await offMin(), a: from, b: to })).forEach(o => ws.addRow([o.invoice_no, o.local, o.employee, o.customer_name, o.payment_method, o.subtotal, o.discount_total, o.tax_total, o.total, o.paid, o.status]));
+  (await D.all(`SELECT o.*,u.name employee,to_char((o.created_at AT TIME ZONE 'UTC') + (@off::int * interval '1 minute'),'YYYY-MM-DD HH24:MI:SS') AS local FROM orders o JOIN users u ON u.id=o.user_id WHERE ${L} BETWEEN @a AND @b${req.team ? ' AND o.user_id=ANY(@team)' : ''} ORDER BY o.id`, { off: await offMin(), a: from, b: to, team: req.team })).forEach(o => ws.addRow([o.invoice_no, o.local, o.employee, o.customer_name, o.payment_method, o.subtotal, o.discount_total, o.tax_total, o.total, o.paid, o.status]));
   const buf = await wb.xlsx.writeBuffer(); res.set({ 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="report-${from}_${to}.xlsx"` }); res.end(Buffer.from(buf));
 }));
 
@@ -593,7 +594,7 @@ app.delete('/api/settings/logo', auth, ownerOnly, wrap(async (req, res) => { con
 // ───────── logs, settings, export ─────────
 app.get('/api/logs', auth, need('logs.view'), wrap(async (req, res) => {
   const own = req.user.role === 'owner';
-  res.json(await D.all(`SELECT l.*,u.role FROM activity_logs l LEFT JOIN users u ON u.id=l.user_id WHERE (l.action ILIKE @q OR COALESCE(l.username,'') ILIKE @q OR COALESCE(l.detail,'') ILIKE @q) ${own ? '' : "AND COALESCE(u.role,'')<>'owner'"} ORDER BY l.id DESC LIMIT 300`, { q: `%${str(req.query.q, 40)}%` }));
+  res.json(await D.all(`SELECT l.*,u.role FROM activity_logs l LEFT JOIN users u ON u.id=l.user_id WHERE (l.action ILIKE @q OR COALESCE(l.username,'') ILIKE @q OR COALESCE(l.detail,'') ILIKE @q) ${own ? '' : 'AND l.user_id=ANY(@team)'} ORDER BY l.id DESC LIMIT 300`, { team: req.team, q: `%${str(req.query.q, 40)}%` }));
 }));
 app.get('/api/errors', auth, ownerOnly, wrap(async (req, res) => res.json(await D.all('SELECT id,context,message,created_at FROM error_logs ORDER BY id DESC LIMIT 30'))));
 app.patch('/api/settings', auth, ownerOnly, wrap(async (req, res) => {
