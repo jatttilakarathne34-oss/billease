@@ -4,9 +4,7 @@
   "description": "BillEase POS & business management (Vercel + Postgres)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "node tests/smoke.js",
-    "build": "node scripts/build-assets.js"
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
@@ -23,8 +21,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "devDependencies": {
-    "@electric-sql/pglite": "^0.5.15"
   }
 }
